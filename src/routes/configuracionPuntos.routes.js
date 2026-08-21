@@ -1,0 +1,52 @@
+import { Router } from 'express';
+
+import {
+  obtenerConfiguracionPuntos,
+  actualizarConfiguracionPuntos,
+  obtenerSaldoPuntosCajero,
+  listarMovimientosPuntosCajero,
+  listarResumenPuntosCajeros,
+  canjearPuntosCajero,
+} from '../controllers/configuracionPuntos.controller.js';
+
+import { verificarToken } from '../middlewares/auth.middleware.js';
+
+const router = Router();
+
+router.get(
+  '/',
+  verificarToken,
+  obtenerConfiguracionPuntos
+);
+
+router.put(
+  '/',
+  verificarToken,
+  actualizarConfiguracionPuntos
+);
+
+router.get(
+  '/cajeros/resumen',
+  verificarToken,
+  listarResumenPuntosCajeros
+);
+
+router.get(
+  '/cajeros/movimientos',
+  verificarToken,
+  listarMovimientosPuntosCajero
+);
+
+router.get(
+  '/cajeros/:id_usuario/saldo',
+  verificarToken,
+  obtenerSaldoPuntosCajero
+);
+
+router.post(
+  '/cajeros/:id_usuario/canjear',
+  verificarToken,
+  canjearPuntosCajero
+);
+
+export default router;
