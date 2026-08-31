@@ -238,6 +238,7 @@ const descontarLotesFEFO = async ({
   client,
   id_sucursal,
   id_producto,
+  id_variante = null,
   cantidadVenta,
 }) => {
   let cantidadPendiente = Number(cantidadVenta);
@@ -246,12 +247,14 @@ const descontarLotesFEFO = async ({
     `
     SELECT 
       id_lote,
+      id_variante,
       lote,
       fecha_caducidad,
       stock_actual
     FROM inventario_lotes
     WHERE id_sucursal = $1
       AND id_producto = $2
+      AND id_variante IS NOT DISTINCT FROM $3::integer
       AND activo = true
       AND stock_actual > 0
     ORDER BY
@@ -260,7 +263,7 @@ const descontarLotesFEFO = async ({
       id_lote ASC
     FOR UPDATE
     `,
-    [id_sucursal, id_producto]
+    [id_sucursal, id_producto, id_variante]
   );
 
   const stockTotalLotes = lotesResultado.rows.reduce((acc, lote) => {
@@ -300,6 +303,7 @@ const descontarLotesFEFO = async ({
 
     lotesDescontados.push({
       id_lote: loteItem.id_lote,
+      id_variante: loteItem.id_variante || null,
       lote: loteItem.lote,
       fecha_caducidad: loteItem.fecha_caducidad,
       cantidad_descontada: cantidadADescontar,
@@ -320,6 +324,7 @@ const descontarLoteSeleccionado = async ({
   client,
   id_sucursal,
   id_producto,
+  id_variante = null,
   id_lote,
   cantidadVenta,
 }) => {
@@ -331,6 +336,7 @@ const descontarLoteSeleccionado = async ({
       id_lote,
       id_sucursal,
       id_producto,
+      id_variante,
       lote,
       fecha_caducidad,
       stock_actual,
@@ -339,9 +345,10 @@ const descontarLoteSeleccionado = async ({
     WHERE id_lote = $1
       AND id_sucursal = $2
       AND id_producto = $3
+      AND id_variante IS NOT DISTINCT FROM $4::integer
     FOR UPDATE
     `,
-    [id_lote, id_sucursal, id_producto]
+    [id_lote, id_sucursal, id_producto, id_variante]
   );
 
   if (loteResultado.rows.length === 0) {
@@ -404,6 +411,7 @@ const descontarLoteSeleccionado = async ({
     lotes_descontados: [
       {
         id_lote: loteItem.id_lote,
+        id_variante: loteItem.id_variante || null,
         lote: loteItem.lote,
         fecha_caducidad: loteItem.fecha_caducidad,
         cantidad_descontada: cantidadADescontar,
@@ -658,6 +666,9 @@ export const crearVenta = async (req, res) => {
 
     for (const item of productosVenta) {
       const { id_producto, cantidad } = item;
+      const idVarianteSeleccionada = item.id_variante
+        ? Number(item.id_variante)
+        : null;
       const idLoteSeleccionado = item.id_lote ? Number(item.id_lote) : null;
 
       if (!id_producto || !cantidad || Number(cantidad) <= 0) {
@@ -678,6 +689,7 @@ export const crearVenta = async (req, res) => {
     nombre,
     precio_venta,
     activo,
+    usa_variantes,
     controla_lotes,
     controla_caducidad
   FROM productos
@@ -697,6 +709,98 @@ export const crearVenta = async (req, res) => {
       }
 
       const producto = productoResultado.rows[0];
+      const usaVariantes = esValorActivo(producto.usa_variantes);
+
+      let varianteSeleccionada = null;
+      let stockVarianteAnterior = null;
+      let stockVarianteNuevo = null;
+
+      if (usaVariantes) {
+        if (
+          !Number.isInteger(idVarianteSeleccionada) ||
+          idVarianteSeleccionada <= 0
+        ) {
+          await client.query('ROLLBACK');
+
+          return res.status(400).json({
+            ok: false,
+            mensaje: `Debes seleccionar una variante para ${producto.nombre}`,
+          });
+        }
+
+        const varianteResultado = await client.query(
+          `
+          SELECT
+            ivs.id_inventario_variante,
+            ivs.stock_actual,
+            ivs.activo AS inventario_variante_activo,
+            pv.id_variante,
+            pv.nombre_variante,
+            pv.sku,
+            pv.codigo_barras,
+            pv.talla,
+            pv.color,
+            pv.tono,
+            pv.presentacion,
+            pv.precio_venta AS precio_venta_variante,
+            COALESCE(pv.atributos, '{}'::jsonb) AS atributos,
+            pv.activo AS variante_activa
+          FROM inventario_variantes_sucursal ivs
+          INNER JOIN producto_variantes pv
+            ON pv.id_variante = ivs.id_variante
+          WHERE ivs.id_sucursal = $1
+            AND ivs.id_producto = $2
+            AND ivs.id_variante = $3
+          FOR UPDATE OF ivs
+          `,
+          [id_sucursal, id_producto, idVarianteSeleccionada]
+        );
+
+        if (varianteResultado.rows.length === 0) {
+          await client.query('ROLLBACK');
+
+          return res.status(404).json({
+            ok: false,
+            mensaje: `La variante seleccionada de ${producto.nombre} no existe en esta sucursal`,
+          });
+        }
+
+        varianteSeleccionada = varianteResultado.rows[0];
+
+        if (
+          !esValorActivo(varianteSeleccionada.variante_activa) ||
+          !esValorActivo(varianteSeleccionada.inventario_variante_activo)
+        ) {
+          await client.query('ROLLBACK');
+
+          return res.status(400).json({
+            ok: false,
+            mensaje: `La variante seleccionada de ${producto.nombre} está inactiva`,
+          });
+        }
+
+        stockVarianteAnterior = Number(
+          varianteSeleccionada.stock_actual || 0
+        );
+
+        if (stockVarianteAnterior < Number(cantidad)) {
+          await client.query('ROLLBACK');
+
+          return res.status(400).json({
+            ok: false,
+            mensaje: `Stock insuficiente para la variante ${varianteSeleccionada.nombre_variante || idVarianteSeleccionada} de ${producto.nombre}`,
+            stock_variante: stockVarianteAnterior,
+            cantidad_solicitada: Number(cantidad),
+          });
+        }
+      } else if (idVarianteSeleccionada) {
+        await client.query('ROLLBACK');
+
+        return res.status(400).json({
+          ok: false,
+          mensaje: `El producto ${producto.nombre} no está configurado para usar variantes`,
+        });
+      }
 
       const inventarioResultado = await client.query(
         `
@@ -734,7 +838,13 @@ export const crearVenta = async (req, res) => {
         });
       }
 
-      const precioBaseDB = redondearDos(producto.precio_venta);
+      const precioBaseDB = redondearDos(
+        varianteSeleccionada?.precio_venta_variante !== undefined &&
+        varianteSeleccionada?.precio_venta_variante !== null &&
+        varianteSeleccionada?.precio_venta_variante !== ''
+          ? varianteSeleccionada.precio_venta_variante
+          : producto.precio_venta
+      );
 
       const idOferta = item.id_oferta ? Number(item.id_oferta) : null;
       const porcentajeDescuento = redondearDos(item.porcentaje_descuento || 0);
@@ -826,6 +936,7 @@ export const crearVenta = async (req, res) => {
           client,
           id_sucursal,
           id_producto,
+          id_variante: idVarianteSeleccionada,
           id_lote: idLoteSeleccionado,
           cantidadVenta,
         })
@@ -833,6 +944,7 @@ export const crearVenta = async (req, res) => {
           client,
           id_sucursal,
           id_producto,
+          id_variante: idVarianteSeleccionada,
           cantidadVenta,
         });
 
@@ -846,6 +958,31 @@ export const crearVenta = async (req, res) => {
           stock_lote: resultadoLotes.stock_lote,
           cantidad_solicitada: resultadoLotes.cantidad_solicitada,
         });
+      }
+
+      if (usaVariantes) {
+        stockVarianteNuevo = redondearDos(
+          stockVarianteAnterior - cantidadVenta
+        );
+
+        await client.query(
+          `
+          UPDATE inventario_variantes_sucursal
+          SET
+            stock_actual = $1,
+            activo = CASE WHEN $1::numeric > 0 THEN true ELSE activo END,
+            fecha_actualizacion = CURRENT_TIMESTAMP
+          WHERE id_sucursal = $2
+            AND id_producto = $3
+            AND id_variante = $4
+          `,
+          [
+            stockVarianteNuevo,
+            id_sucursal,
+            id_producto,
+            idVarianteSeleccionada,
+          ]
+        );
       }
 
       const stockNuevo = stockActual - cantidadVenta;
@@ -870,6 +1007,11 @@ export const crearVenta = async (req, res) => {
 
       productosProcesados.push({
         id_producto,
+        id_variante: idVarianteSeleccionada,
+        nombre_variante: varianteSeleccionada?.nombre_variante || null,
+        sku_variante: varianteSeleccionada?.sku || null,
+        codigo_barras_variante: varianteSeleccionada?.codigo_barras || null,
+        atributos_variante: varianteSeleccionada?.atributos || {},
         id_lote: lotePrincipal?.id_lote || null,
         lote: lotePrincipal?.lote || null,
         fecha_caducidad: lotePrincipal?.fecha_caducidad || null,
@@ -1206,6 +1348,7 @@ export const crearVenta = async (req, res) => {
         INSERT INTO venta_detalle (
           id_venta,
           id_producto,
+          id_variante,
           id_lote,
           cantidad,
           precio_unitario,
@@ -1217,13 +1360,14 @@ export const crearVenta = async (req, res) => {
           subtotal
         )
         VALUES (
-          $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11
+          $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12
         )
         RETURNING id_detalle
         `,
         [
           venta.id_venta,
           item.id_producto,
+          item.id_variante,
           item.id_lote,
           item.cantidad,
           item.precio_unitario,
@@ -1242,6 +1386,7 @@ export const crearVenta = async (req, res) => {
           INSERT INTO inventario_movimientos (
             id_sucursal,
             id_producto,
+            id_variante,
             id_lote,
             tipo_movimiento,
             cantidad,
@@ -1251,11 +1396,12 @@ export const crearVenta = async (req, res) => {
             observaciones,
             id_usuario
           )
-          VALUES ($1,$2,$3,'VENTA',$4,$5,$6,$7,$8,$9)
+          VALUES ($1,$2,$3,$4,'VENTA',$5,$6,$7,$8,$9,$10)
           `,
           [
             id_sucursal,
             item.id_producto,
+            item.id_variante,
             loteDesc.id_lote,
             loteDesc.cantidad_descontada,
             item.stock_anterior,
@@ -1590,8 +1736,17 @@ export const obtenerInfoDevolucionVenta = async (req, res) => {
         vd.id_detalle,
         vd.id_venta,
         vd.id_producto,
+        vd.id_variante,
         p.nombre AS producto,
         p.codigo_barras,
+        pv.nombre_variante,
+        pv.sku AS sku_variante,
+        pv.codigo_barras AS codigo_barras_variante,
+        pv.talla,
+        pv.color,
+        pv.tono,
+        pv.presentacion AS presentacion_variante,
+        COALESCE(pv.atributos, '{}'::jsonb) AS atributos_variante,
         vd.id_lote,
         il.lote,
         il.fecha_caducidad,
@@ -1605,6 +1760,7 @@ export const obtenerInfoDevolucionVenta = async (req, res) => {
         )::numeric(12,2) AS cantidad_disponible_devolver
       FROM venta_detalle vd
       INNER JOIN productos p ON p.id_producto = vd.id_producto
+      LEFT JOIN producto_variantes pv ON pv.id_variante = vd.id_variante
       LEFT JOIN inventario_lotes il ON il.id_lote = vd.id_lote
       LEFT JOIN (
         SELECT
@@ -1863,6 +2019,15 @@ export const obtenerVenta = async (req, res) => {
       SELECT
         vd.id_detalle,
         vd.id_producto,
+        vd.id_variante,
+        pv.nombre_variante,
+        pv.sku AS sku_variante,
+        pv.codigo_barras AS codigo_barras_variante,
+        pv.talla,
+        pv.color,
+        pv.tono,
+        pv.presentacion AS presentacion_variante,
+        COALESCE(pv.atributos, '{}'::jsonb) AS atributos_variante,
         vd.id_lote,
         il.lote,
         il.fecha_caducidad,
@@ -1879,6 +2044,7 @@ export const obtenerVenta = async (req, res) => {
         vd.subtotal
       FROM venta_detalle vd
       INNER JOIN productos p ON p.id_producto = vd.id_producto
+      LEFT JOIN producto_variantes pv ON pv.id_variante = vd.id_variante
       LEFT JOIN inventario_lotes il ON il.id_lote = vd.id_lote
       LEFT JOIN ofertas_categorias oc ON oc.id_oferta = vd.id_oferta
       WHERE vd.id_venta = $1
@@ -1909,6 +2075,15 @@ export const obtenerVenta = async (req, res) => {
         im.id_movimiento,
         im.id_producto,
         p.nombre AS producto,
+        im.id_variante,
+        pv.nombre_variante,
+        pv.sku AS sku_variante,
+        pv.codigo_barras AS codigo_barras_variante,
+        pv.talla,
+        pv.color,
+        pv.tono,
+        pv.presentacion AS presentacion_variante,
+        COALESCE(pv.atributos, '{}'::jsonb) AS atributos_variante,
         im.id_lote,
         il.lote,
         il.fecha_caducidad,
@@ -1920,6 +2095,7 @@ export const obtenerVenta = async (req, res) => {
         im.fecha_movimiento
       FROM inventario_movimientos im
       INNER JOIN productos p ON p.id_producto = im.id_producto
+      LEFT JOIN producto_variantes pv ON pv.id_variante = im.id_variante
       LEFT JOIN inventario_lotes il ON il.id_lote = im.id_lote
       WHERE im.referencia = $1
         AND im.tipo_movimiento = 'VENTA'
@@ -2075,15 +2251,18 @@ export const devolverVenta = async (req, res) => {
           vd.id_detalle,
           vd.id_venta,
           vd.id_producto,
+          vd.id_variante,
           p.nombre AS producto,
+          pv.nombre_variante,
           vd.cantidad,
           vd.precio_unitario,
           vd.subtotal
         FROM venta_detalle vd
         INNER JOIN productos p ON p.id_producto = vd.id_producto
+        LEFT JOIN producto_variantes pv ON pv.id_variante = vd.id_variante
         WHERE vd.id_detalle = $1
           AND vd.id_venta = $2
-        FOR UPDATE
+        FOR UPDATE OF vd
         `,
         [idDetalle, venta.id_venta]
       );
@@ -2149,7 +2328,10 @@ export const devolverVenta = async (req, res) => {
       detallesDevueltos.push({
         id_detalle: detalle.id_detalle,
         id_producto: detalle.id_producto,
-        producto: detalle.producto,
+        id_variante: detalle.id_variante || null,
+        producto: detalle.nombre_variante
+          ? `${detalle.producto} · ${detalle.nombre_variante}`
+          : detalle.producto,
         cantidad_devuelta: cantidadSolicitada,
         precio_unitario: precioProporcionalSubtotal,
         subtotal_devuelto: subtotalDevuelto,
@@ -2208,6 +2390,7 @@ export const devolverVenta = async (req, res) => {
         `
         SELECT
           im.id_lote,
+          im.id_variante,
           il.lote,
           im.cantidad,
           im.stock_nuevo
@@ -2216,9 +2399,10 @@ export const devolverVenta = async (req, res) => {
         WHERE im.referencia = $1
           AND im.tipo_movimiento = 'VENTA'
           AND im.id_producto = $2
+          AND im.id_variante IS NOT DISTINCT FROM $3::integer
         ORDER BY im.fecha_movimiento ASC, im.id_movimiento ASC
         `,
-        [venta.folio, detalle.id_producto]
+        [venta.folio, detalle.id_producto, detalle.id_variante]
       );
 
       if (lotesVentaResultado.rows.length === 0) {
@@ -2239,9 +2423,15 @@ export const devolverVenta = async (req, res) => {
           FROM ventas_devoluciones_detalle
           WHERE id_venta = $1
             AND id_producto = $2
-            AND id_lote IS NOT DISTINCT FROM $3
+            AND id_variante IS NOT DISTINCT FROM $3::integer
+            AND id_lote IS NOT DISTINCT FROM $4
           `,
-          [venta.id_venta, detalle.id_producto, loteVenta.id_lote]
+          [
+            venta.id_venta,
+            detalle.id_producto,
+            detalle.id_variante,
+            loteVenta.id_lote,
+          ]
         );
 
         const cantidadLoteVendida = Number(loteVenta.cantidad || 0);
@@ -2262,12 +2452,14 @@ export const devolverVenta = async (req, res) => {
           `
           SELECT
             id_lote,
+            id_variante,
             stock_actual
           FROM inventario_lotes
           WHERE id_lote = $1
+            AND id_variante IS NOT DISTINCT FROM $2::integer
           FOR UPDATE
           `,
-          [loteVenta.id_lote]
+          [loteVenta.id_lote, detalle.id_variante]
         );
 
         if (loteActualResultado.rows.length === 0) {
@@ -2297,6 +2489,62 @@ export const devolverVenta = async (req, res) => {
           `,
           [stockLoteNuevo, loteVenta.id_lote]
         );
+
+        if (detalle.id_variante) {
+          const inventarioVarianteResultado = await client.query(
+            `
+            SELECT
+              id_inventario_variante,
+              stock_actual
+            FROM inventario_variantes_sucursal
+            WHERE id_sucursal = $1
+              AND id_producto = $2
+              AND id_variante = $3
+            FOR UPDATE
+            `,
+            [
+              venta.id_sucursal,
+              detalle.id_producto,
+              detalle.id_variante,
+            ]
+          );
+
+          if (inventarioVarianteResultado.rows.length === 0) {
+            await client.query('ROLLBACK');
+
+            return res.status(404).json({
+              ok: false,
+              mensaje: `No se encontró el inventario de la variante para ${detalle.producto}`,
+            });
+          }
+
+          const stockVarianteAnterior = Number(
+            inventarioVarianteResultado.rows[0].stock_actual || 0
+          );
+
+          const stockVarianteNuevo = redondearDos(
+            stockVarianteAnterior + cantidadARestituir
+          );
+
+          await client.query(
+            `
+            UPDATE inventario_variantes_sucursal
+            SET
+              stock_actual = $1,
+              activo = true,
+              fecha_actualizacion = CURRENT_TIMESTAMP
+            WHERE id_sucursal = $2
+              AND id_producto = $3
+              AND id_variante = $4
+            `,
+            [
+              stockVarianteNuevo,
+              venta.id_sucursal,
+              detalle.id_producto,
+              detalle.id_variante,
+            ]
+          );
+        }
 
         const inventarioResultado = await client.query(
           `
@@ -2350,19 +2598,21 @@ export const devolverVenta = async (req, res) => {
             id_venta,
             id_detalle,
             id_producto,
+            id_variante,
             id_lote,
             producto,
             cantidad_devuelta,
             precio_unitario,
             subtotal_devuelto
           )
-          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
           `,
           [
             devolucion.id_devolucion,
             venta.id_venta,
             detalle.id_detalle,
             detalle.id_producto,
+            detalle.id_variante,
             loteVenta.id_lote,
             detalle.producto,
             cantidadARestituir,
@@ -2376,6 +2626,7 @@ export const devolverVenta = async (req, res) => {
           INSERT INTO inventario_movimientos (
             id_sucursal,
             id_producto,
+            id_variante,
             id_lote,
             tipo_movimiento,
             cantidad,
@@ -2385,11 +2636,12 @@ export const devolverVenta = async (req, res) => {
             observaciones,
             id_usuario
           )
-          VALUES ($1,$2,$3,'DEVOLUCION_VENTA',$4,$5,$6,$7,$8,$9)
+          VALUES ($1,$2,$3,$4,'DEVOLUCION_VENTA',$5,$6,$7,$8,$9,$10)
           `,
           [
             venta.id_sucursal,
             detalle.id_producto,
+            detalle.id_variante,
             loteVenta.id_lote,
             cantidadARestituir,
             stockSucursalAnterior,

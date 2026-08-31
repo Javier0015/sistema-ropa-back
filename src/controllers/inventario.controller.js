@@ -8,6 +8,544 @@ const normalizarLote = (lote) => {
   return lote.trim().toUpperCase();
 };
 
+const normalizarBooleano = (valor, valorDefault = false) => {
+  if (valor === undefined || valor === null || valor === '') {
+    return valorDefault;
+  }
+
+  if (typeof valor === 'boolean') return valor;
+
+  return ['true', '1', 'si', 'sí', 's'].includes(
+    String(valor).trim().toLowerCase()
+  );
+};
+
+const normalizarTextoNullable = (valor) => {
+  const texto = String(valor ?? '').trim();
+  return texto ? texto : null;
+};
+
+const configuracionVariantesDefault = {
+  talla: false,
+  color: false,
+  tono: false,
+  genero: false,
+  presentacion: false,
+  material: false,
+  modelo: false,
+  aroma: false,
+  capacidad: false,
+  personalizados: [],
+};
+
+const normalizarConfiguracionVariantes = (valor) => {
+  let origen = valor;
+
+  if (typeof origen === 'string') {
+    try {
+      origen = JSON.parse(origen);
+    } catch {
+      origen = {};
+    }
+  }
+
+  if (!origen || typeof origen !== 'object' || Array.isArray(origen)) {
+    origen = {};
+  }
+
+  return {
+    ...configuracionVariantesDefault,
+    ...origen,
+    personalizados: Array.isArray(origen.personalizados)
+      ? origen.personalizados
+          .map((item) => ({
+            clave: String(item?.clave || '').trim(),
+            etiqueta: String(item?.etiqueta || '').trim(),
+          }))
+          .filter((item) => item.clave && item.etiqueta)
+      : [],
+  };
+};
+
+const obtenerClavesVariantesConfiguradas = (configuracion) => {
+  const config = normalizarConfiguracionVariantes(configuracion);
+
+  const base = [
+    'talla',
+    'color',
+    'tono',
+    'genero',
+    'presentacion',
+    'material',
+    'modelo',
+    'aroma',
+    'capacidad',
+  ].filter((clave) => normalizarBooleano(config[clave], false));
+
+  const personalizados = (config.personalizados || []).map(
+    (item) => item.clave
+  );
+
+  return [...base, ...personalizados];
+};
+
+const normalizarAtributosEntrada = (
+  variante,
+  configuracionVariantes
+) => {
+  const claves = obtenerClavesVariantesConfiguradas(
+    configuracionVariantes
+  );
+
+  const origen =
+    variante?.atributos &&
+    typeof variante.atributos === 'object' &&
+    !Array.isArray(variante.atributos)
+      ? variante.atributos
+      : {};
+
+  const atributos = {};
+
+  for (const clave of claves) {
+    const valorDirecto = variante?.[clave];
+    const valor = normalizarTextoNullable(
+      valorDirecto ?? origen?.[clave]
+    );
+
+    if (!valor) {
+      const error = new Error(
+        `Falta capturar el atributo "${clave}" en una variante`
+      );
+      error.statusCode = 400;
+      throw error;
+    }
+
+    atributos[clave] = valor;
+  }
+
+  return atributos;
+};
+
+const obtenerNombreVarianteDesdeAtributos = (
+  variante,
+  atributos,
+  configuracionVariantes
+) => {
+  const nombreManual = normalizarTextoNullable(
+    variante?.nombre_variante
+  );
+
+  if (nombreManual) return nombreManual;
+
+  const claves = obtenerClavesVariantesConfiguradas(
+    configuracionVariantes
+  );
+
+  return (
+    claves
+      .map((clave) => atributos?.[clave])
+      .filter(Boolean)
+      .join(' · ') || 'Variante'
+  );
+};
+
+const buscarOCrearVariante = async ({
+  client,
+  producto,
+  variante,
+}) => {
+  const atributos = normalizarAtributosEntrada(
+    variante,
+    producto.configuracion_variantes
+  );
+
+  const talla = normalizarTextoNullable(
+    variante?.talla ?? atributos.talla
+  );
+  const color = normalizarTextoNullable(
+    variante?.color ?? atributos.color
+  );
+  const tono = normalizarTextoNullable(
+    variante?.tono ?? atributos.tono
+  );
+  const presentacion = normalizarTextoNullable(
+    variante?.presentacion ?? atributos.presentacion
+  );
+
+  const sku = normalizarTextoNullable(variante?.sku);
+  const codigoBarras = normalizarTextoNullable(
+    variante?.codigo_barras
+  );
+
+  const nombreVariante = obtenerNombreVarianteDesdeAtributos(
+    variante,
+    atributos,
+    producto.configuracion_variantes
+  );
+
+  let existente = null;
+
+  const idVarianteSolicitada = Number(variante?.id_variante || 0);
+
+  if (
+    Number.isInteger(idVarianteSolicitada) &&
+    idVarianteSolicitada > 0
+  ) {
+    const resultado = await client.query(
+      `
+        SELECT *
+        FROM producto_variantes
+        WHERE id_variante = $1
+          AND id_producto = $2
+        LIMIT 1
+      `,
+      [idVarianteSolicitada, producto.id_producto]
+    );
+
+    existente = resultado.rows[0] || null;
+  }
+
+  if (!existente && sku) {
+    const resultado = await client.query(
+      `
+        SELECT *
+        FROM producto_variantes
+        WHERE id_producto = $1
+          AND LOWER(COALESCE(sku, '')) = LOWER($2)
+        LIMIT 1
+      `,
+      [producto.id_producto, sku]
+    );
+
+    existente = resultado.rows[0] || null;
+  }
+
+  if (!existente && codigoBarras) {
+    const resultado = await client.query(
+      `
+        SELECT *
+        FROM producto_variantes
+        WHERE id_producto = $1
+          AND codigo_barras = $2
+        LIMIT 1
+      `,
+      [producto.id_producto, codigoBarras]
+    );
+
+    existente = resultado.rows[0] || null;
+  }
+
+  if (!existente) {
+    const resultado = await client.query(
+      `
+        SELECT *
+        FROM producto_variantes
+        WHERE id_producto = $1
+          AND COALESCE(talla, '') = COALESCE($2, '')
+          AND COALESCE(color, '') = COALESCE($3, '')
+          AND COALESCE(tono, '') = COALESCE($4, '')
+          AND COALESCE(presentacion, '') = COALESCE($5, '')
+          AND COALESCE(atributos, '{}'::jsonb) = $6::jsonb
+        LIMIT 1
+      `,
+      [
+        producto.id_producto,
+        talla,
+        color,
+        tono,
+        presentacion,
+        JSON.stringify(atributos),
+      ]
+    );
+
+    existente = resultado.rows[0] || null;
+  }
+
+  if (existente) {
+    const actualizado = await client.query(
+      `
+        UPDATE producto_variantes
+        SET
+          nombre_variante = COALESCE(NULLIF($1, ''), nombre_variante),
+          sku = COALESCE(NULLIF($2, ''), sku),
+          codigo_barras = COALESCE(NULLIF($3, ''), codigo_barras),
+          talla = $4,
+          color = $5,
+          tono = $6,
+          presentacion = $7,
+          precio_compra = COALESCE($8, precio_compra),
+          precio_venta = COALESCE($9, precio_venta),
+          atributos = $10::jsonb,
+          activo = true,
+          fecha_actualizacion = CURRENT_TIMESTAMP
+        WHERE id_variante = $11
+        RETURNING *
+      `,
+      [
+        nombreVariante,
+        sku,
+        codigoBarras,
+        talla,
+        color,
+        tono,
+        presentacion,
+        variante?.precio_compra !== undefined &&
+        variante?.precio_compra !== null &&
+        variante?.precio_compra !== ''
+          ? Number(variante.precio_compra)
+          : null,
+        variante?.precio_venta !== undefined &&
+        variante?.precio_venta !== null &&
+        variante?.precio_venta !== ''
+          ? Number(variante.precio_venta)
+          : null,
+        JSON.stringify(atributos),
+        existente.id_variante,
+      ]
+    );
+
+    return actualizado.rows[0];
+  }
+
+  const creado = await client.query(
+    `
+      INSERT INTO producto_variantes (
+        id_producto,
+        sku,
+        codigo_barras,
+        nombre_variante,
+        talla,
+        color,
+        tono,
+        presentacion,
+        precio_compra,
+        precio_venta,
+        es_principal,
+        activo,
+        atributos
+      )
+      VALUES (
+        $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,false,true,$11::jsonb
+      )
+      RETURNING *
+    `,
+    [
+      producto.id_producto,
+      sku,
+      codigoBarras,
+      nombreVariante,
+      talla,
+      color,
+      tono,
+      presentacion,
+      variante?.precio_compra !== undefined &&
+      variante?.precio_compra !== null &&
+      variante?.precio_compra !== ''
+        ? Number(variante.precio_compra)
+        : Number(producto.precio_compra || 0),
+      variante?.precio_venta !== undefined &&
+      variante?.precio_venta !== null &&
+      variante?.precio_venta !== ''
+        ? Number(variante.precio_venta)
+        : Number(producto.precio_venta || 0),
+      JSON.stringify(atributos),
+    ]
+  );
+
+  return creado.rows[0];
+};
+
+const obtenerStockVarianteSucursal = async ({
+  client,
+  idSucursal,
+  idProducto,
+  idVariante,
+}) => {
+  const resultado = await client.query(
+    `
+      SELECT *
+      FROM inventario_variantes_sucursal
+      WHERE id_sucursal = $1
+        AND id_producto = $2
+        AND id_variante = $3
+      FOR UPDATE
+    `,
+    [idSucursal, idProducto, idVariante]
+  );
+
+  return resultado.rows[0] || null;
+};
+
+const sumarStockVarianteSucursal = async ({
+  client,
+  idSucursal,
+  idProducto,
+  idVariante,
+  cantidad,
+  ubicacion,
+}) => {
+  const actual = await obtenerStockVarianteSucursal({
+    client,
+    idSucursal,
+    idProducto,
+    idVariante,
+  });
+
+  if (actual) {
+    const stockNuevo =
+      Number(actual.stock_actual || 0) + Number(cantidad || 0);
+
+    const actualizado = await client.query(
+      `
+        UPDATE inventario_variantes_sucursal
+        SET
+          stock_actual = $1,
+          ubicacion = COALESCE($2, ubicacion),
+          activo = true,
+          fecha_actualizacion = CURRENT_TIMESTAMP
+        WHERE id_inventario_variante = $3
+        RETURNING *
+      `,
+      [
+        stockNuevo,
+        normalizarTextoNullable(ubicacion),
+        actual.id_inventario_variante,
+      ]
+    );
+
+    return {
+      anterior: Number(actual.stock_actual || 0),
+      nuevo: stockNuevo,
+      registro: actualizado.rows[0],
+    };
+  }
+
+  const creado = await client.query(
+    `
+      INSERT INTO inventario_variantes_sucursal (
+        id_sucursal,
+        id_producto,
+        id_variante,
+        stock_actual,
+        stock_minimo,
+        ubicacion,
+        activo
+      )
+      VALUES ($1,$2,$3,$4,0,$5,true)
+      RETURNING *
+    `,
+    [
+      idSucursal,
+      idProducto,
+      idVariante,
+      Number(cantidad || 0),
+      normalizarTextoNullable(ubicacion),
+    ]
+  );
+
+  return {
+    anterior: 0,
+    nuevo: Number(cantidad || 0),
+    registro: creado.rows[0],
+  };
+};
+
+const sumarStockLote = async ({
+  client,
+  idSucursal,
+  idProducto,
+  idVariante = null,
+  idProveedor = null,
+  lote,
+  fechaCaducidad = null,
+  cantidad,
+  precioCompra = 0,
+}) => {
+  const resultado = await client.query(
+    `
+      SELECT *
+      FROM inventario_lotes
+      WHERE id_sucursal = $1
+        AND id_producto = $2
+        AND id_variante IS NOT DISTINCT FROM $3::integer
+        AND lote = $4
+        AND fecha_caducidad IS NOT DISTINCT FROM $5::date
+      ORDER BY id_lote ASC
+      LIMIT 1
+      FOR UPDATE
+    `,
+    [
+      idSucursal,
+      idProducto,
+      idVariante,
+      lote,
+      fechaCaducidad,
+    ]
+  );
+
+  if (resultado.rows.length > 0) {
+    const actual = resultado.rows[0];
+    const stockNuevo =
+      Number(actual.stock_actual || 0) + Number(cantidad || 0);
+
+    const actualizado = await client.query(
+      `
+        UPDATE inventario_lotes
+        SET
+          stock_actual = $1,
+          id_proveedor = COALESCE($2, id_proveedor),
+          precio_compra = COALESCE($3, precio_compra),
+          activo = true,
+          fecha_actualizacion = CURRENT_TIMESTAMP
+        WHERE id_lote = $4
+        RETURNING *
+      `,
+      [
+        stockNuevo,
+        idProveedor || null,
+        precioCompra !== undefined &&
+        precioCompra !== null &&
+        precioCompra !== ''
+          ? Number(precioCompra)
+          : null,
+        actual.id_lote,
+      ]
+    );
+
+    return actualizado.rows[0];
+  }
+
+  const creado = await client.query(
+    `
+      INSERT INTO inventario_lotes (
+        id_sucursal,
+        id_producto,
+        id_variante,
+        id_proveedor,
+        lote,
+        fecha_caducidad,
+        stock_actual,
+        precio_compra,
+        activo
+      )
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,true)
+      RETURNING *
+    `,
+    [
+      idSucursal,
+      idProducto,
+      idVariante,
+      idProveedor || null,
+      lote,
+      fechaCaducidad,
+      Number(cantidad || 0),
+      Number(precioCompra || 0),
+    ]
+  );
+
+  return creado.rows[0];
+};
+
 const movimientosEntrada = [
   'ENTRADA',
   'AJUSTE_POSITIVO',
@@ -66,6 +604,7 @@ export const listarInventarioPorSucursal = async (req, res) => {
         p.precio_compra,
         p.precio_venta,
         p.usa_variantes,
+        p.configuracion_variantes,
         p.controla_lotes,
         p.controla_caducidad,
         p.activo,
@@ -73,7 +612,7 @@ export const listarInventarioPorSucursal = async (req, res) => {
         i.stock_minimo,
         i.ubicacion,
 
-        CASE 
+        CASE
           WHEN i.stock_actual <= i.stock_minimo THEN true
           ELSE false
         END AS bajo_stock,
@@ -90,11 +629,11 @@ export const listarInventarioPorSucursal = async (req, res) => {
         CASE
           WHEN oc.id_oferta IS NOT NULL THEN
             ROUND(
-              p.precio_venta - (p.precio_venta * oc.porcentaje_descuento / 100),
+              p.precio_venta -
+              (p.precio_venta * oc.porcentaje_descuento / 100),
               2
             )
-          ELSE
-            p.precio_venta
+          ELSE p.precio_venta
         END AS precio_con_descuento,
 
         CASE
@@ -103,26 +642,28 @@ export const listarInventarioPorSucursal = async (req, res) => {
               p.precio_venta * oc.porcentaje_descuento / 100,
               2
             )
-          ELSE
-            0
+          ELSE 0
         END AS descuento_unitario,
 
         i.fecha_actualizacion,
         COALESCE(lotes.total_lotes, 0) AS total_lotes,
         lotes.proxima_caducidad,
+        COALESCE(vars.total_variantes, 0) AS total_variantes,
+        COALESCE(vars.variantes, '[]'::jsonb) AS variantes,
 
         CASE
           WHEN lotes.proxima_caducidad IS NULL THEN false
-          WHEN lotes.proxima_caducidad <= CURRENT_DATE + INTERVAL '90 days' THEN true
+          WHEN lotes.proxima_caducidad <=
+            CURRENT_DATE + INTERVAL '90 days' THEN true
           ELSE false
         END AS caducidad_proxima
 
       FROM inventario_sucursal i
-      INNER JOIN sucursales s 
+      INNER JOIN sucursales s
         ON s.id_sucursal = i.id_sucursal
-      INNER JOIN productos p 
+      INNER JOIN productos p
         ON p.id_producto = i.id_producto
-      LEFT JOIN categorias c 
+      LEFT JOIN categorias c
         ON c.id_categoria = p.id_categoria
       LEFT JOIN marcas m
         ON m.id_marca = p.id_marca
@@ -133,20 +674,53 @@ export const listarInventarioPorSucursal = async (req, res) => {
        AND CURRENT_DATE BETWEEN oc.fecha_inicio AND oc.fecha_fin
 
       LEFT JOIN (
-        SELECT 
+        SELECT
           id_sucursal,
           id_producto,
           COUNT(*) AS total_lotes,
           MIN(fecha_caducidad) FILTER (
-            WHERE stock_actual > 0 
-              AND activo = true 
+            WHERE stock_actual > 0
+              AND activo = true
               AND fecha_caducidad IS NOT NULL
           ) AS proxima_caducidad
         FROM inventario_lotes
         GROUP BY id_sucursal, id_producto
-      ) lotes 
+      ) lotes
         ON lotes.id_sucursal = i.id_sucursal
        AND lotes.id_producto = i.id_producto
+
+      LEFT JOIN LATERAL (
+        SELECT
+          COUNT(*) AS total_variantes,
+          jsonb_agg(
+            jsonb_build_object(
+              'id_inventario_variante', ivs.id_inventario_variante,
+              'id_variante', pv.id_variante,
+              'nombre_variante', pv.nombre_variante,
+              'sku', pv.sku,
+              'codigo_barras', pv.codigo_barras,
+              'talla', pv.talla,
+              'color', pv.color,
+              'tono', pv.tono,
+              'presentacion', pv.presentacion,
+              'precio_compra', pv.precio_compra,
+              'precio_venta', pv.precio_venta,
+              'atributos', COALESCE(pv.atributos, '{}'::jsonb),
+              'stock_actual', ivs.stock_actual,
+              'stock_minimo', ivs.stock_minimo,
+              'ubicacion', ivs.ubicacion,
+              'activo', ivs.activo
+            )
+            ORDER BY pv.nombre_variante, pv.id_variante
+          ) AS variantes
+        FROM inventario_variantes_sucursal ivs
+        INNER JOIN producto_variantes pv
+          ON pv.id_variante = ivs.id_variante
+        WHERE ivs.id_sucursal = i.id_sucursal
+          AND ivs.id_producto = i.id_producto
+          AND ivs.activo = true
+          AND pv.activo = true
+      ) vars ON true
 
       WHERE i.id_sucursal = $1
         AND p.activo = true
@@ -167,7 +741,6 @@ export const listarInventarioPorSucursal = async (req, res) => {
       });
     }
 
-    
     if (tieneIdProducto) {
       params.push(idProducto);
       query += ` AND i.id_producto = $${params.length} `;
@@ -181,15 +754,28 @@ export const listarInventarioPorSucursal = async (req, res) => {
           OR p.descripcion ILIKE $${params.length}
           OR m.nombre ILIKE $${params.length}
           OR p.presentacion ILIKE $${params.length}
+          OR EXISTS (
+            SELECT 1
+            FROM inventario_variantes_sucursal ivb
+            INNER JOIN producto_variantes pvb
+              ON pvb.id_variante = ivb.id_variante
+            WHERE ivb.id_sucursal = i.id_sucursal
+              AND ivb.id_producto = i.id_producto
+              AND (
+                pvb.nombre_variante ILIKE $${params.length}
+                OR pvb.sku ILIKE $${params.length}
+                OR pvb.codigo_barras ILIKE $${params.length}
+                OR pvb.talla ILIKE $${params.length}
+                OR pvb.color ILIKE $${params.length}
+                OR pvb.tono ILIKE $${params.length}
+              )
+          )
         )
       `;
     }
 
-    query += `
-      ORDER BY p.nombre ASC
-    `;
+    query += ` ORDER BY p.nombre ASC `;
 
-    
     if (
       String(autocomplete).trim() === '1' &&
       !tieneIdProducto
@@ -215,6 +801,7 @@ export const listarInventarioPorSucursal = async (req, res) => {
     return res.status(500).json({
       ok: false,
       mensaje: 'Error interno al listar inventario',
+      error: error.message,
     });
   }
 };
@@ -232,32 +819,45 @@ export const listarBajoStock = async (req, res) => {
 
     const resultado = await pool.query(
       `
-      SELECT
-        i.id_inventario,
-        i.id_sucursal,
-        s.nombre AS sucursal,
-        i.id_producto,
-        p.codigo_barras,
-        p.nombre AS producto,
-        c.nombre AS categoria,
-        p.id_marca,
-        m.nombre AS marca,
-        p.presentacion,
-        p.usa_variantes,
-        p.controla_lotes,
-        p.controla_caducidad,
-        i.stock_actual,
-        i.stock_minimo,
-        i.ubicacion,
-        i.fecha_actualizacion
-      FROM inventario_sucursal i
-      INNER JOIN sucursales s ON s.id_sucursal = i.id_sucursal
-      INNER JOIN productos p ON p.id_producto = i.id_producto
-      LEFT JOIN categorias c ON c.id_categoria = p.id_categoria
-      LEFT JOIN marcas m ON m.id_marca = p.id_marca
-      WHERE i.id_sucursal = $1
-      AND i.stock_actual <= i.stock_minimo
-      ORDER BY i.stock_actual ASC, p.nombre ASC
+        SELECT
+          i.id_inventario,
+          i.id_sucursal,
+          s.nombre AS sucursal,
+          i.id_producto,
+          p.codigo_barras,
+          p.nombre AS producto,
+          c.nombre AS categoria,
+          p.id_marca,
+          m.nombre AS marca,
+          p.presentacion,
+          p.usa_variantes,
+          p.configuracion_variantes,
+          p.controla_lotes,
+          p.controla_caducidad,
+          i.stock_actual,
+          i.stock_minimo,
+          i.ubicacion,
+          i.fecha_actualizacion,
+          COALESCE(vars.total_variantes, 0) AS total_variantes
+        FROM inventario_sucursal i
+        INNER JOIN sucursales s
+          ON s.id_sucursal = i.id_sucursal
+        INNER JOIN productos p
+          ON p.id_producto = i.id_producto
+        LEFT JOIN categorias c
+          ON c.id_categoria = p.id_categoria
+        LEFT JOIN marcas m
+          ON m.id_marca = p.id_marca
+        LEFT JOIN LATERAL (
+          SELECT COUNT(*) AS total_variantes
+          FROM inventario_variantes_sucursal ivs
+          WHERE ivs.id_sucursal = i.id_sucursal
+            AND ivs.id_producto = i.id_producto
+            AND ivs.activo = true
+        ) vars ON true
+        WHERE i.id_sucursal = $1
+          AND i.stock_actual <= i.stock_minimo
+        ORDER BY i.stock_actual ASC, p.nombre ASC
       `,
       [sucursal]
     );
@@ -272,6 +872,7 @@ export const listarBajoStock = async (req, res) => {
     return res.status(500).json({
       ok: false,
       mensaje: 'Error interno al listar productos con bajo stock',
+      error: error.message,
     });
   }
 };
@@ -291,147 +892,443 @@ export const asignarInventario = async (req, res) => {
       fecha_caducidad,
       precio_compra,
       observaciones,
+      variantes = [],
     } = req.body;
 
-    if (!id_sucursal || !id_producto) {
+    const idSucursal = Number(id_sucursal);
+    const idProducto = Number(id_producto);
+
+    if (
+      !Number.isInteger(idSucursal) ||
+      idSucursal <= 0 ||
+      !Number.isInteger(idProducto) ||
+      idProducto <= 0
+    ) {
       return res.status(400).json({
         ok: false,
         mensaje: 'La sucursal y el producto son obligatorios',
       });
     }
 
-    if (Number(stock_inicial) < 0) {
-      return res.status(400).json({
+    await client.query('BEGIN');
+
+    const productoResultado = await client.query(
+      `
+        SELECT
+          id_producto,
+          nombre,
+          precio_compra,
+          precio_venta,
+          usa_variantes,
+          configuracion_variantes,
+          controla_lotes,
+          controla_caducidad,
+          activo
+        FROM productos
+        WHERE id_producto = $1
+        LIMIT 1
+        FOR SHARE
+      `,
+      [idProducto]
+    );
+
+    if (productoResultado.rows.length === 0) {
+      await client.query('ROLLBACK');
+
+      return res.status(404).json({
         ok: false,
-        mensaje: 'El stock inicial no puede ser negativo',
+        mensaje: 'El producto no existe',
       });
     }
 
-    const stockInicial = Number(stock_inicial || 0);
-    const loteNormalizado = normalizarLote(lote);
+    const producto = productoResultado.rows[0];
 
-    await client.query('BEGIN');
+    if (!producto.activo) {
+      await client.query('ROLLBACK');
 
-    const existe = await client.query(
-      `
-      SELECT id_inventario
-      FROM inventario_sucursal
-      WHERE id_sucursal = $1
-      AND id_producto = $2
-      `,
-      [id_sucursal, id_producto]
+      return res.status(400).json({
+        ok: false,
+        mensaje: 'El producto está inactivo',
+      });
+    }
+
+    const usaVariantes = normalizarBooleano(
+      producto.usa_variantes,
+      false
     );
 
-    if (existe.rows.length > 0) {
+    const controlaLotes = normalizarBooleano(
+      producto.controla_lotes,
+      false
+    );
+
+    const controlaCaducidad = normalizarBooleano(
+      producto.controla_caducidad,
+      false
+    );
+
+    const inventarioExistenteResultado = await client.query(
+      `
+        SELECT *
+        FROM inventario_sucursal
+        WHERE id_sucursal = $1
+          AND id_producto = $2
+        FOR UPDATE
+      `,
+      [idSucursal, idProducto]
+    );
+
+    const inventarioExistente =
+      inventarioExistenteResultado.rows[0] || null;
+
+    if (!usaVariantes && inventarioExistente) {
       await client.query('ROLLBACK');
 
       return res.status(409).json({
         ok: false,
-        mensaje: 'Ese producto ya tiene inventario asignado en esta sucursal',
+        mensaje:
+          'Ese producto ya tiene inventario asignado en esta sucursal',
       });
     }
 
-    const inventario = await client.query(
-      `
-      INSERT INTO inventario_sucursal (
-        id_sucursal,
-        id_producto,
-        stock_actual,
-        stock_minimo,
-        ubicacion
-      )
-      VALUES ($1, $2, $3, $4, $5)
-      RETURNING *
-      `,
-      [
-        id_sucursal,
-        id_producto,
-        stockInicial,
-        stock_minimo || 0,
-        ubicacion || null,
-      ]
-    );
+    let cantidadTotalEntrada = 0;
 
-    let loteCreado = null;
+    if (usaVariantes) {
+      if (!Array.isArray(variantes) || variantes.length === 0) {
+        await client.query('ROLLBACK');
 
-    if (stockInicial > 0) {
-      const loteResultado = await client.query(
+        return res.status(400).json({
+          ok: false,
+          mensaje:
+            'El producto usa variantes. Debes enviar al menos una variante.',
+        });
+      }
+
+      const clavesConfiguradas =
+        obtenerClavesVariantesConfiguradas(
+          producto.configuracion_variantes
+        );
+
+      if (clavesConfiguradas.length === 0) {
+        await client.query('ROLLBACK');
+
+        return res.status(400).json({
+          ok: false,
+          mensaje:
+            'El producto usa variantes pero no tiene configuracion_variantes definida.',
+        });
+      }
+
+      for (const variante of variantes) {
+        const cantidad = Number(variante?.stock_inicial ?? 0);
+
+        if (!Number.isFinite(cantidad) || cantidad < 0) {
+          await client.query('ROLLBACK');
+
+          return res.status(400).json({
+            ok: false,
+            mensaje:
+              'La cantidad inicial de cada variante debe ser igual o mayor a cero.',
+          });
+        }
+
+        cantidadTotalEntrada += cantidad;
+      }
+    } else {
+      cantidadTotalEntrada = Number(stock_inicial || 0);
+
+      if (
+        !Number.isFinite(cantidadTotalEntrada) ||
+        cantidadTotalEntrada < 0
+      ) {
+        await client.query('ROLLBACK');
+
+        return res.status(400).json({
+          ok: false,
+          mensaje: 'El stock inicial no puede ser negativo',
+        });
+      }
+    }
+
+    if (
+      controlaLotes &&
+      cantidadTotalEntrada > 0 &&
+      !normalizarTextoNullable(lote)
+    ) {
+      await client.query('ROLLBACK');
+
+      return res.status(400).json({
+        ok: false,
+        mensaje:
+          'Este producto controla lotes. El lote es obligatorio.',
+      });
+    }
+
+    if (
+      controlaCaducidad &&
+      cantidadTotalEntrada > 0 &&
+      !fecha_caducidad
+    ) {
+      await client.query('ROLLBACK');
+
+      return res.status(400).json({
+        ok: false,
+        mensaje:
+          'Este producto controla caducidad. La fecha de vencimiento es obligatoria.',
+      });
+    }
+
+    const loteNormalizado = controlaLotes
+      ? normalizarLote(lote)
+      : 'SIN-LOTE';
+
+    const fechaCaducidadNormalizada = controlaCaducidad
+      ? fecha_caducidad || null
+      : null;
+
+    let inventario;
+
+    if (inventarioExistente) {
+      const stockNuevo =
+        Number(inventarioExistente.stock_actual || 0) +
+        cantidadTotalEntrada;
+
+      const actualizado = await client.query(
         `
-      INSERT INTO inventario_lotes (
-  id_sucursal,
-  id_producto,
-  id_proveedor,
-  lote,
-  fecha_caducidad,
-  stock_actual,
-  precio_compra,
-  activo
-)
-VALUES ($1,$2,$3,$4,$5,$6,$7,true)
-RETURNING *
+          UPDATE inventario_sucursal
+          SET
+            stock_actual = $1,
+            stock_minimo = COALESCE($2, stock_minimo),
+            ubicacion = COALESCE($3, ubicacion),
+            fecha_actualizacion = CURRENT_TIMESTAMP
+          WHERE id_inventario = $4
+          RETURNING *
         `,
         [
-          id_sucursal,
-          id_producto,
-          id_proveedor || null,
-          loteNormalizado,
-          fecha_caducidad || null,
-          stockInicial,
-          precio_compra || 0,
+          stockNuevo,
+          stock_minimo === '' ||
+          stock_minimo === undefined ||
+          stock_minimo === null
+            ? null
+            : Number(stock_minimo),
+          normalizarTextoNullable(ubicacion),
+          inventarioExistente.id_inventario,
         ]
       );
 
-      loteCreado = loteResultado.rows[0];
+      inventario = actualizado.rows[0];
+    } else {
+      const creado = await client.query(
+        `
+          INSERT INTO inventario_sucursal (
+            id_sucursal,
+            id_producto,
+            stock_actual,
+            stock_minimo,
+            ubicacion
+          )
+          VALUES ($1,$2,$3,$4,$5)
+          RETURNING *
+        `,
+        [
+          idSucursal,
+          idProducto,
+          cantidadTotalEntrada,
+          Number(stock_minimo || 0),
+          normalizarTextoNullable(ubicacion),
+        ]
+      );
+
+      inventario = creado.rows[0];
     }
 
-    await client.query(
-      `
-   INSERT INTO inventario_movimientos (
-  id_sucursal,
-  id_producto,
-  id_lote,
-  id_proveedor,
-  tipo_movimiento,
-  cantidad,
-  stock_anterior,
-  stock_nuevo,
-  referencia,
-  observaciones,
-  id_usuario
-)
-VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
-      `,
-      [
-        id_sucursal,
-        id_producto,
-        loteCreado?.id_lote || null,
-        id_proveedor || null,
-        'STOCK_INICIAL',
-        stockInicial,
-        0,
-        stockInicial,
-        'ASIGNACION_INICIAL',
-        observaciones || 'Asignación inicial de inventario',
-        req.usuario?.id_usuario || null,
-      ]
-    );
+    const stockGeneralAnterior = inventarioExistente
+      ? Number(inventarioExistente.stock_actual || 0)
+      : 0;
+
+    let stockGeneralCursor = stockGeneralAnterior;
+    const variantesGuardadas = [];
+    const lotesCreados = [];
+
+    if (usaVariantes) {
+      for (const varianteEntrada of variantes) {
+        const cantidad = Number(
+          varianteEntrada?.stock_inicial || 0
+        );
+
+        const variante = await buscarOCrearVariante({
+          client,
+          producto,
+          variante: varianteEntrada,
+        });
+
+        const stockVariante =
+          await sumarStockVarianteSucursal({
+            client,
+            idSucursal,
+            idProducto,
+            idVariante: variante.id_variante,
+            cantidad,
+            ubicacion,
+          });
+
+        let loteGuardado = null;
+
+        if (cantidad > 0) {
+          loteGuardado = await sumarStockLote({
+            client,
+            idSucursal,
+            idProducto,
+            idVariante: variante.id_variante,
+            idProveedor: id_proveedor || null,
+            lote: loteNormalizado,
+            fechaCaducidad: fechaCaducidadNormalizada,
+            cantidad,
+            precioCompra:
+              precio_compra !== undefined &&
+              precio_compra !== null &&
+              precio_compra !== ''
+                ? Number(precio_compra)
+                : Number(variante.precio_compra || 0),
+          });
+
+          lotesCreados.push(loteGuardado);
+
+          const stockAntesMovimiento = stockGeneralCursor;
+          stockGeneralCursor += cantidad;
+
+          await client.query(
+            `
+              INSERT INTO inventario_movimientos (
+                id_sucursal,
+                id_producto,
+                id_variante,
+                id_lote,
+                id_proveedor,
+                tipo_movimiento,
+                cantidad,
+                stock_anterior,
+                stock_nuevo,
+                referencia,
+                observaciones,
+                id_usuario
+              )
+              VALUES (
+                $1,$2,$3,$4,$5,'STOCK_INICIAL',$6,$7,$8,$9,$10,$11
+              )
+            `,
+            [
+              idSucursal,
+              idProducto,
+              variante.id_variante,
+              loteGuardado?.id_lote || null,
+              id_proveedor || null,
+              cantidad,
+              stockAntesMovimiento,
+              stockGeneralCursor,
+              inventarioExistente
+                ? 'ALTA_VARIANTE'
+                : 'ASIGNACION_INICIAL',
+              observaciones ||
+                `Inventario inicial de ${variante.nombre_variante}`,
+              req.usuario?.id_usuario || null,
+            ]
+          );
+        }
+
+        variantesGuardadas.push({
+          ...variante,
+          stock_sucursal: stockVariante.registro,
+        });
+      }
+    } else {
+      let loteCreado = null;
+
+      if (cantidadTotalEntrada > 0) {
+        loteCreado = await sumarStockLote({
+          client,
+          idSucursal,
+          idProducto,
+          idVariante: null,
+          idProveedor: id_proveedor || null,
+          lote: loteNormalizado,
+          fechaCaducidad: fechaCaducidadNormalizada,
+          cantidad: cantidadTotalEntrada,
+          precioCompra: Number(precio_compra || 0),
+        });
+
+        lotesCreados.push(loteCreado);
+      }
+
+      await client.query(
+        `
+          INSERT INTO inventario_movimientos (
+            id_sucursal,
+            id_producto,
+            id_variante,
+            id_lote,
+            id_proveedor,
+            tipo_movimiento,
+            cantidad,
+            stock_anterior,
+            stock_nuevo,
+            referencia,
+            observaciones,
+            id_usuario
+          )
+          VALUES ($1,$2,NULL,$3,$4,'STOCK_INICIAL',$5,0,$5,$6,$7,$8)
+        `,
+        [
+          idSucursal,
+          idProducto,
+          loteCreado?.id_lote || null,
+          id_proveedor || null,
+          cantidadTotalEntrada,
+          'ASIGNACION_INICIAL',
+          observaciones || 'Asignación inicial de inventario',
+          req.usuario?.id_usuario || null,
+        ]
+      );
+    }
 
     await client.query('COMMIT');
 
-    return res.status(201).json({
+    return res.status(inventarioExistente ? 200 : 201).json({
       ok: true,
-      mensaje: 'Inventario asignado correctamente',
-      inventario: inventario.rows[0],
-      lote: loteCreado,
+      mensaje: usaVariantes
+        ? inventarioExistente
+          ? 'Variantes agregadas al inventario correctamente'
+          : 'Inventario con variantes asignado correctamente'
+        : 'Inventario asignado correctamente',
+      inventario,
+      variantes: variantesGuardadas,
+      lotes: lotesCreados,
     });
   } catch (error) {
     await client.query('ROLLBACK');
 
     console.error('Error al asignar inventario:', error);
 
+    if (error.statusCode) {
+      return res.status(error.statusCode).json({
+        ok: false,
+        mensaje: error.message,
+      });
+    }
+
+    if (error.code === '23505') {
+      return res.status(409).json({
+        ok: false,
+        mensaje:
+          'Ya existe una variante con el mismo SKU, código de barras o combinación.',
+        error: error.message,
+      });
+    }
+
     return res.status(500).json({
       ok: false,
       mensaje: 'Error interno al asignar inventario',
+      error: error.message,
     });
   } finally {
     client.release();
@@ -445,6 +1342,7 @@ export const ajustarInventario = async (req, res) => {
     const {
       id_sucursal,
       id_producto,
+      id_variante,
       id_proveedor,
       id_lote,
       tipo_movimiento,
@@ -457,14 +1355,26 @@ export const ajustarInventario = async (req, res) => {
       referencia,
       observaciones,
     } = req.body;
-    if (!id_sucursal || !id_producto || !tipo_movimiento || cantidad === undefined) {
+
+    if (
+      !id_sucursal ||
+      !id_producto ||
+      !tipo_movimiento ||
+      cantidad === undefined
+    ) {
       return res.status(400).json({
         ok: false,
-        mensaje: 'Sucursal, producto, tipo de movimiento y cantidad son obligatorios',
+        mensaje:
+          'Sucursal, producto, tipo de movimiento y cantidad son obligatorios',
       });
     }
 
-    if (Number(cantidad) <= 0) {
+    const cantidadMovimiento = Number(cantidad);
+
+    if (
+      !Number.isFinite(cantidadMovimiento) ||
+      cantidadMovimiento <= 0
+    ) {
       return res.status(400).json({
         ok: false,
         mensaje: 'La cantidad debe ser mayor a cero',
@@ -481,145 +1391,286 @@ export const ajustarInventario = async (req, res) => {
 
     await client.query('BEGIN');
 
-    const inventarioActual = await client.query(
+    const inventarioResultado = await client.query(
       `
-      SELECT 
-        id_inventario,
-        stock_actual,
-        stock_minimo,
-        ubicacion
-      FROM inventario_sucursal
-      WHERE id_sucursal = $1
-      AND id_producto = $2
-      FOR UPDATE
+        SELECT
+          i.id_inventario,
+          i.stock_actual,
+          i.stock_minimo,
+          i.ubicacion,
+          p.usa_variantes,
+          p.configuracion_variantes,
+          p.controla_lotes,
+          p.controla_caducidad
+        FROM inventario_sucursal i
+        INNER JOIN productos p
+          ON p.id_producto = i.id_producto
+        WHERE i.id_sucursal = $1
+          AND i.id_producto = $2
+        FOR UPDATE OF i
       `,
       [id_sucursal, id_producto]
     );
 
-    if (inventarioActual.rows.length === 0) {
+    if (inventarioResultado.rows.length === 0) {
       await client.query('ROLLBACK');
 
       return res.status(404).json({
         ok: false,
-        mensaje: 'El producto no tiene inventario asignado en esta sucursal',
+        mensaje:
+          'El producto no tiene inventario asignado en esta sucursal',
       });
     }
 
-    const stockAnterior = Number(inventarioActual.rows[0].stock_actual);
-    const cantidadMovimiento = Number(cantidad);
+    const inventarioActual = inventarioResultado.rows[0];
+    const usaVariantes = normalizarBooleano(
+      inventarioActual.usa_variantes,
+      false
+    );
+    const controlaLotes = normalizarBooleano(
+      inventarioActual.controla_lotes,
+      false
+    );
+    const controlaCaducidad = normalizarBooleano(
+      inventarioActual.controla_caducidad,
+      false
+    );
 
-    let stockNuevo = stockAnterior;
-    let loteMovimientoId = id_lote || null;
+    let varianteActual = null;
+    const idVariante = id_variante ? Number(id_variante) : null;
 
-    if (movimientosEntrada.includes(tipo_movimiento)) {
-      stockNuevo = stockAnterior + cantidadMovimiento;
+    if (usaVariantes) {
+      if (!Number.isInteger(idVariante) || idVariante <= 0) {
+        await client.query('ROLLBACK');
 
-      const loteNormalizado = normalizarLote(lote);
+        return res.status(400).json({
+          ok: false,
+          mensaje:
+            'Selecciona la variante que se modificará en el inventario',
+        });
+      }
 
-      const loteExistente = await client.query(
+      const varianteResultado = await client.query(
         `
-        SELECT id_lote, stock_actual
-        FROM inventario_lotes
-        WHERE id_sucursal = $1
-        AND id_producto = $2
-        AND lote = $3
-        AND (
-          (fecha_caducidad = $4::date)
-          OR (fecha_caducidad IS NULL AND $4::date IS NULL)
-        )
-        FOR UPDATE
+          SELECT
+            ivs.*,
+            pv.nombre_variante,
+            pv.sku,
+            pv.codigo_barras
+          FROM inventario_variantes_sucursal ivs
+          INNER JOIN producto_variantes pv
+            ON pv.id_variante = ivs.id_variante
+          WHERE ivs.id_sucursal = $1
+            AND ivs.id_producto = $2
+            AND ivs.id_variante = $3
+          FOR UPDATE OF ivs
         `,
-        [
-          id_sucursal,
-          id_producto,
-          loteNormalizado,
-          fecha_caducidad || null,
-        ]
+        [id_sucursal, id_producto, idVariante]
       );
 
-      if (loteExistente.rows.length > 0) {
-        const loteActual = loteExistente.rows[0];
-        const nuevoStockLote = Number(loteActual.stock_actual) + cantidadMovimiento;
+      if (varianteResultado.rows.length === 0) {
+        await client.query('ROLLBACK');
 
-        const loteActualizado = await client.query(
-          `
-UPDATE inventario_lotes
-SET
-  stock_actual = $1,
-  precio_compra = COALESCE($2, precio_compra),
-  id_proveedor = COALESCE($3, id_proveedor),
-  activo = true,
-  fecha_actualizacion = CURRENT_TIMESTAMP
-WHERE id_lote = $4
-RETURNING *
-          `,
-          [
-            nuevoStockLote,
-            precio_compra || null,
-            id_proveedor || null,
-            loteActual.id_lote,
-          ]
-        );
+        return res.status(404).json({
+          ok: false,
+          mensaje:
+            'La variante no tiene inventario asignado en esta sucursal',
+        });
+      }
 
-        loteMovimientoId = loteActualizado.rows[0].id_lote;
-      } else {
-        const loteNuevo = await client.query(
-          `
-  INSERT INTO inventario_lotes (
-  id_sucursal,
-  id_producto,
-  id_proveedor,
-  lote,
-  fecha_caducidad,
-  stock_actual,
-  precio_compra,
-  activo
-)
-VALUES ($1,$2,$3,$4,$5,$6,$7,true)
-RETURNING *
-          `,
-          [
-            id_sucursal,
-            id_producto,
-            id_proveedor || null,
-            loteNormalizado,
-            fecha_caducidad || null,
-            cantidadMovimiento,
-            precio_compra || 0,
-          ]
-        );
+      varianteActual = varianteResultado.rows[0];
+    }
 
-        loteMovimientoId = loteNuevo.rows[0].id_lote;
+    const stockAnterior = Number(
+      inventarioActual.stock_actual || 0
+    );
+
+    const stockVarianteAnterior = varianteActual
+      ? Number(varianteActual.stock_actual || 0)
+      : null;
+
+    const esEntrada = movimientosEntrada.includes(
+      tipo_movimiento
+    );
+    const esSalida = movimientosSalida.includes(
+      tipo_movimiento
+    );
+
+    let stockNuevo = stockAnterior;
+    let stockVarianteNuevo = stockVarianteAnterior;
+
+    if (esEntrada) {
+      stockNuevo += cantidadMovimiento;
+
+      if (varianteActual) {
+        stockVarianteNuevo += cantidadMovimiento;
       }
     }
 
-    if (movimientosSalida.includes(tipo_movimiento)) {
-      stockNuevo = stockAnterior - cantidadMovimiento;
+    if (esSalida) {
+      stockNuevo -= cantidadMovimiento;
 
       if (stockNuevo < 0) {
         await client.query('ROLLBACK');
 
         return res.status(400).json({
           ok: false,
-          mensaje: 'No hay stock suficiente para realizar este movimiento',
+          mensaje:
+            'No hay stock suficiente para realizar este movimiento',
           stock_actual: stockAnterior,
           cantidad_solicitada: cantidadMovimiento,
         });
       }
 
+      if (varianteActual) {
+        stockVarianteNuevo -= cantidadMovimiento;
+
+        if (stockVarianteNuevo < 0) {
+          await client.query('ROLLBACK');
+
+          return res.status(400).json({
+            ok: false,
+            mensaje:
+              'La variante seleccionada no tiene stock suficiente',
+            stock_variante: stockVarianteAnterior,
+            cantidad_solicitada: cantidadMovimiento,
+          });
+        }
+      }
+    }
+
+    let loteMovimientoId = id_lote || null;
+
+    if (esEntrada) {
+      if (id_lote) {
+        const loteActualResultado = await client.query(
+          `
+            SELECT *
+            FROM inventario_lotes
+            WHERE id_lote = $1
+              AND id_sucursal = $2
+              AND id_producto = $3
+              AND id_variante IS NOT DISTINCT FROM $4::integer
+            FOR UPDATE
+          `,
+          [
+            id_lote,
+            id_sucursal,
+            id_producto,
+            usaVariantes ? idVariante : null,
+          ]
+        );
+
+        if (loteActualResultado.rows.length === 0) {
+          await client.query('ROLLBACK');
+
+          return res.status(404).json({
+            ok: false,
+            mensaje:
+              'El lote indicado no corresponde al producto/variante seleccionado',
+          });
+        }
+
+        const loteActual = loteActualResultado.rows[0];
+
+        const loteActualizado = await client.query(
+          `
+            UPDATE inventario_lotes
+            SET
+              stock_actual = stock_actual + $1,
+              id_proveedor = COALESCE($2, id_proveedor),
+              precio_compra = COALESCE($3, precio_compra),
+              activo = true,
+              fecha_actualizacion = CURRENT_TIMESTAMP
+            WHERE id_lote = $4
+            RETURNING *
+          `,
+          [
+            cantidadMovimiento,
+            id_proveedor || null,
+            precio_compra !== undefined &&
+            precio_compra !== null &&
+            precio_compra !== ''
+              ? Number(precio_compra)
+              : null,
+            loteActual.id_lote,
+          ]
+        );
+
+        loteMovimientoId =
+          loteActualizado.rows[0].id_lote;
+      } else {
+        if (
+          controlaLotes &&
+          !normalizarTextoNullable(lote)
+        ) {
+          await client.query('ROLLBACK');
+
+          return res.status(400).json({
+            ok: false,
+            mensaje:
+              'Este producto controla lotes. Captura el lote de entrada.',
+          });
+        }
+
+        if (
+          controlaCaducidad &&
+          !fecha_caducidad
+        ) {
+          await client.query('ROLLBACK');
+
+          return res.status(400).json({
+            ok: false,
+            mensaje:
+              'Este producto controla caducidad. Captura la fecha de vencimiento.',
+          });
+        }
+
+        const loteGuardado = await sumarStockLote({
+          client,
+          idSucursal: id_sucursal,
+          idProducto: id_producto,
+          idVariante: usaVariantes ? idVariante : null,
+          idProveedor: id_proveedor || null,
+          lote: controlaLotes
+            ? normalizarLote(lote)
+            : 'SIN-LOTE',
+          fechaCaducidad: controlaCaducidad
+            ? fecha_caducidad || null
+            : null,
+          cantidad: cantidadMovimiento,
+          precioCompra:
+            precio_compra !== undefined &&
+            precio_compra !== null &&
+            precio_compra !== ''
+              ? Number(precio_compra)
+              : 0,
+        });
+
+        loteMovimientoId = loteGuardado.id_lote;
+      }
+    }
+
+    if (esSalida) {
       let cantidadPendiente = cantidadMovimiento;
 
       if (id_lote) {
         const loteActual = await client.query(
           `
-          SELECT id_lote, stock_actual
-          FROM inventario_lotes
-          WHERE id_lote = $1
-          AND id_sucursal = $2
-          AND id_producto = $3
-          FOR UPDATE
+            SELECT id_lote, stock_actual
+            FROM inventario_lotes
+            WHERE id_lote = $1
+              AND id_sucursal = $2
+              AND id_producto = $3
+              AND id_variante IS NOT DISTINCT FROM $4::integer
+            FOR UPDATE
           `,
-          [id_lote, id_sucursal, id_producto]
+          [
+            id_lote,
+            id_sucursal,
+            id_producto,
+            usaVariantes ? idVariante : null,
+          ]
         );
 
         if (loteActual.rows.length === 0) {
@@ -627,11 +1678,14 @@ RETURNING *
 
           return res.status(404).json({
             ok: false,
-            mensaje: 'El lote indicado no existe para este producto y sucursal',
+            mensaje:
+              'El lote indicado no existe para este producto/variante',
           });
         }
 
-        const stockLote = Number(loteActual.rows[0].stock_actual);
+        const stockLote = Number(
+          loteActual.rows[0].stock_actual
+        );
 
         if (stockLote < cantidadMovimiento) {
           await client.query('ROLLBACK');
@@ -644,16 +1698,19 @@ RETURNING *
           });
         }
 
-        const nuevoStockLote = stockLote - cantidadMovimiento;
+        const nuevoStockLote =
+          stockLote - cantidadMovimiento;
 
         await client.query(
           `
-          UPDATE inventario_lotes
-          SET
-            stock_actual = $1,
-            activo = CASE WHEN $1::numeric <= 0::numeric THEN false ELSE true END,
-            fecha_actualizacion = CURRENT_TIMESTAMP
-          WHERE id_lote = $2
+            UPDATE inventario_lotes
+            SET
+              stock_actual = $1,
+              activo =
+                CASE WHEN $1::numeric <= 0::numeric
+                THEN false ELSE true END,
+              fecha_actualizacion = CURRENT_TIMESTAMP
+            WHERE id_lote = $2
           `,
           [nuevoStockLote, id_lote]
         );
@@ -662,35 +1719,51 @@ RETURNING *
       } else {
         const lotesDisponibles = await client.query(
           `
-          SELECT id_lote, stock_actual
-          FROM inventario_lotes
-          WHERE id_sucursal = $1
-          AND id_producto = $2
-          AND activo = true
-          AND stock_actual > 0
-          ORDER BY 
-            fecha_caducidad ASC NULLS LAST,
-            fecha_entrada ASC
-          FOR UPDATE
+            SELECT id_lote, stock_actual
+            FROM inventario_lotes
+            WHERE id_sucursal = $1
+              AND id_producto = $2
+              AND id_variante IS NOT DISTINCT FROM $3::integer
+              AND activo = true
+              AND stock_actual > 0
+            ORDER BY
+              fecha_caducidad ASC NULLS LAST,
+              fecha_entrada ASC,
+              id_lote ASC
+            FOR UPDATE
           `,
-          [id_sucursal, id_producto]
+          [
+            id_sucursal,
+            id_producto,
+            usaVariantes ? idVariante : null,
+          ]
         );
 
         for (const loteItem of lotesDisponibles.rows) {
           if (cantidadPendiente <= 0) break;
 
-          const stockLote = Number(loteItem.stock_actual);
-          const cantidadADescontar = Math.min(stockLote, cantidadPendiente);
-          const nuevoStockLote = stockLote - cantidadADescontar;
+          const stockLote = Number(
+            loteItem.stock_actual
+          );
+
+          const cantidadADescontar = Math.min(
+            stockLote,
+            cantidadPendiente
+          );
+
+          const nuevoStockLote =
+            stockLote - cantidadADescontar;
 
           await client.query(
             `
-            UPDATE inventario_lotes
-            SET
-              stock_actual = $1,
-              activo = CASE WHEN $1::numeric <= 0::numeric THEN false ELSE true END,
-              fecha_actualizacion = CURRENT_TIMESTAMP
-            WHERE id_lote = $2
+              UPDATE inventario_lotes
+              SET
+                stock_actual = $1,
+                activo =
+                  CASE WHEN $1::numeric <= 0::numeric
+                  THEN false ELSE true END,
+                fecha_actualizacion = CURRENT_TIMESTAMP
+              WHERE id_lote = $2
             `,
             [nuevoStockLote, loteItem.id_lote]
           );
@@ -707,28 +1780,52 @@ RETURNING *
 
           return res.status(400).json({
             ok: false,
-            mensaje: 'No hay stock suficiente por lotes para realizar este movimiento',
+            mensaje:
+              'No hay stock suficiente por lotes para realizar este movimiento',
           });
         }
       }
     }
 
+    if (varianteActual) {
+      await client.query(
+        `
+          UPDATE inventario_variantes_sucursal
+          SET
+            stock_actual = $1,
+            ubicacion = COALESCE($2, ubicacion),
+            activo = true,
+            fecha_actualizacion = CURRENT_TIMESTAMP
+          WHERE id_inventario_variante = $3
+        `,
+        [
+          stockVarianteNuevo,
+          normalizarTextoNullable(ubicacion),
+          varianteActual.id_inventario_variante,
+        ]
+      );
+    }
+
     const inventarioActualizado = await client.query(
       `
-      UPDATE inventario_sucursal
-      SET 
-        stock_actual = $1,
-        stock_minimo = COALESCE($2, stock_minimo),
-        ubicacion = COALESCE($3, ubicacion),
-        fecha_actualizacion = CURRENT_TIMESTAMP
-      WHERE id_sucursal = $4
-      AND id_producto = $5
-      RETURNING *
+        UPDATE inventario_sucursal
+        SET
+          stock_actual = $1,
+          stock_minimo = COALESCE($2, stock_minimo),
+          ubicacion = COALESCE($3, ubicacion),
+          fecha_actualizacion = CURRENT_TIMESTAMP
+        WHERE id_sucursal = $4
+          AND id_producto = $5
+        RETURNING *
       `,
       [
         stockNuevo,
-        stock_minimo,
-        ubicacion || null,
+        stock_minimo === undefined ||
+        stock_minimo === null ||
+        stock_minimo === ''
+          ? null
+          : Number(stock_minimo),
+        normalizarTextoNullable(ubicacion),
         id_sucursal,
         id_producto,
       ]
@@ -736,25 +1833,29 @@ RETURNING *
 
     const movimiento = await client.query(
       `
- INSERT INTO inventario_movimientos (
-  id_sucursal,
-  id_producto,
-  id_lote,
-  id_proveedor,
-  tipo_movimiento,
-  cantidad,
-  stock_anterior,
-  stock_nuevo,
-  referencia,
-  observaciones,
-  id_usuario
-)
-VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
-RETURNING *
+        INSERT INTO inventario_movimientos (
+          id_sucursal,
+          id_producto,
+          id_variante,
+          id_lote,
+          id_proveedor,
+          tipo_movimiento,
+          cantidad,
+          stock_anterior,
+          stock_nuevo,
+          referencia,
+          observaciones,
+          id_usuario
+        )
+        VALUES (
+          $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12
+        )
+        RETURNING *
       `,
       [
         id_sucursal,
         id_producto,
+        usaVariantes ? idVariante : null,
         loteMovimientoId,
         id_proveedor || null,
         tipo_movimiento,
@@ -774,6 +1875,9 @@ RETURNING *
       mensaje: 'Inventario actualizado correctamente',
       inventario: inventarioActualizado.rows[0],
       movimiento: movimiento.rows[0],
+      stock_variante: varianteActual
+        ? stockVarianteNuevo
+        : null,
     });
   } catch (error) {
     await client.query('ROLLBACK');
@@ -783,6 +1887,7 @@ RETURNING *
     return res.status(500).json({
       ok: false,
       mensaje: 'Error interno al ajustar inventario',
+      error: error.message,
     });
   } finally {
     client.release();
@@ -791,7 +1896,13 @@ RETURNING *
 
 export const listarMovimientosInventario = async (req, res) => {
   try {
-    const { sucursal, producto, tipo, fecha_inicio, fecha_fin } = req.query;
+    const {
+      sucursal,
+      producto,
+      tipo,
+      fecha_inicio,
+      fecha_fin,
+    } = req.query;
 
     if (!sucursal) {
       return res.status(400).json({
@@ -809,6 +1920,16 @@ export const listarMovimientosInventario = async (req, res) => {
         m.id_producto,
         p.nombre AS producto,
         p.codigo_barras,
+
+        m.id_variante,
+        pv.nombre_variante,
+        pv.sku,
+        pv.codigo_barras AS codigo_barras_variante,
+        pv.talla,
+        pv.color,
+        pv.tono,
+        pv.presentacion AS presentacion_variante,
+        COALESCE(pv.atributos, '{}'::jsonb) AS atributos,
 
         m.id_lote,
         il.lote,
@@ -829,15 +1950,17 @@ export const listarMovimientosInventario = async (req, res) => {
 
         m.fecha_movimiento
       FROM inventario_movimientos m
-      INNER JOIN sucursales s 
+      INNER JOIN sucursales s
         ON s.id_sucursal = m.id_sucursal
-      INNER JOIN productos p 
+      INNER JOIN productos p
         ON p.id_producto = m.id_producto
-      LEFT JOIN usuarios u 
+      LEFT JOIN producto_variantes pv
+        ON pv.id_variante = m.id_variante
+      LEFT JOIN usuarios u
         ON u.id_usuario = m.id_usuario
-      LEFT JOIN inventario_lotes il 
+      LEFT JOIN inventario_lotes il
         ON il.id_lote = m.id_lote
-      LEFT JOIN proveedores prv 
+      LEFT JOIN proveedores prv
         ON prv.id_proveedor = m.id_proveedor
       WHERE m.id_sucursal = $1
     `;
@@ -856,17 +1979,18 @@ export const listarMovimientosInventario = async (req, res) => {
 
     if (fecha_inicio) {
       params.push(fecha_inicio);
-      query += ` AND m.fecha_movimiento >= $${params.length}::date `;
+      query +=
+        ` AND m.fecha_movimiento >= $${params.length}::date `;
     }
 
     if (fecha_fin) {
       params.push(fecha_fin);
-      query += ` AND m.fecha_movimiento < ($${params.length}::date + INTERVAL '1 day') `;
+      query +=
+        ` AND m.fecha_movimiento < ` +
+        `($${params.length}::date + INTERVAL '1 day') `;
     }
 
-    query += `
-      ORDER BY m.fecha_movimiento DESC
-    `;
+    query += ` ORDER BY m.fecha_movimiento DESC `;
 
     const resultado = await pool.query(query, params);
 
@@ -879,7 +2003,9 @@ export const listarMovimientosInventario = async (req, res) => {
 
     return res.status(500).json({
       ok: false,
-      mensaje: 'Error interno al listar movimientos de inventario',
+      mensaje:
+        'Error interno al listar movimientos de inventario',
+      error: error.message,
     });
   }
 };
@@ -905,6 +2031,16 @@ export const listarLotesProducto = async (req, res) => {
         p.nombre AS producto,
         p.codigo_barras,
 
+        il.id_variante,
+        pv.nombre_variante,
+        pv.sku,
+        pv.codigo_barras AS codigo_barras_variante,
+        pv.talla,
+        pv.color,
+        pv.tono,
+        pv.presentacion AS presentacion_variante,
+        COALESCE(pv.atributos, '{}'::jsonb) AS atributos,
+
         il.id_proveedor,
         prv.nombre AS proveedor,
 
@@ -922,7 +2058,8 @@ export const listarLotesProducto = async (req, res) => {
 
         CASE
           WHEN il.fecha_caducidad IS NULL THEN false
-          WHEN il.fecha_caducidad <= CURRENT_DATE + INTERVAL '90 days' THEN true
+          WHEN il.fecha_caducidad <=
+            CURRENT_DATE + INTERVAL '90 days' THEN true
           ELSE false
         END AS caducidad_proxima,
 
@@ -932,16 +2069,18 @@ export const listarLotesProducto = async (req, res) => {
           ELSE false
         END AS caducado
       FROM inventario_lotes il
-      INNER JOIN sucursales s 
+      INNER JOIN sucursales s
         ON s.id_sucursal = il.id_sucursal
-      INNER JOIN productos p 
+      INNER JOIN productos p
         ON p.id_producto = il.id_producto
+      LEFT JOIN producto_variantes pv
+        ON pv.id_variante = il.id_variante
       LEFT JOIN inventario_sucursal i
         ON i.id_sucursal = il.id_sucursal
-      AND i.id_producto = il.id_producto
-      LEFT JOIN proveedores prv 
+       AND i.id_producto = il.id_producto
+      LEFT JOIN proveedores prv
         ON prv.id_proveedor = il.id_proveedor
-      LEFT JOIN compras co 
+      LEFT JOIN compras co
         ON co.id_compra = il.id_compra
       WHERE il.id_sucursal = $1
     `;
@@ -954,7 +2093,8 @@ export const listarLotesProducto = async (req, res) => {
     }
 
     query += `
-      ORDER BY 
+      ORDER BY
+        pv.nombre_variante ASC NULLS FIRST,
         il.fecha_caducidad ASC NULLS LAST,
         il.fecha_entrada ASC
     `;
@@ -971,6 +2111,7 @@ export const listarLotesProducto = async (req, res) => {
     return res.status(500).json({
       ok: false,
       mensaje: 'Error interno al listar lotes',
+      error: error.message,
     });
   }
 };
@@ -1009,7 +2150,8 @@ export const actualizarLote = async (req, res) => {
       precio_compra !== undefined &&
       precio_compra !== null &&
       precio_compra !== '' &&
-      (!Number.isFinite(Number(precio_compra)) || Number(precio_compra) < 0)
+      (!Number.isFinite(Number(precio_compra)) ||
+        Number(precio_compra) < 0)
     ) {
       return res.status(400).json({
         ok: false,
@@ -1033,7 +2175,8 @@ export const actualizarLote = async (req, res) => {
     ) {
       return res.status(400).json({
         ok: false,
-        mensaje: 'El stock del lote debe ser un número igual o mayor a cero',
+        mensaje:
+          'El stock del lote debe ser un número igual o mayor a cero',
       });
     }
 
@@ -1041,19 +2184,20 @@ export const actualizarLote = async (req, res) => {
 
     const loteActualResultado = await client.query(
       `
-      SELECT
-        id_lote,
-        id_sucursal,
-        id_producto,
-        id_proveedor,
-        lote,
-        fecha_caducidad,
-        stock_actual,
-        precio_compra,
-        activo
-      FROM inventario_lotes
-      WHERE id_lote = $1
-      FOR UPDATE
+        SELECT
+          id_lote,
+          id_sucursal,
+          id_producto,
+          id_variante,
+          id_proveedor,
+          lote,
+          fecha_caducidad,
+          stock_actual,
+          precio_compra,
+          activo
+        FROM inventario_lotes
+        WHERE id_lote = $1
+        FOR UPDATE
       `,
       [id_lote]
     );
@@ -1071,14 +2215,14 @@ export const actualizarLote = async (req, res) => {
 
     const inventarioActualResultado = await client.query(
       `
-      SELECT
-        id_inventario,
-        stock_actual,
-        ubicacion
-      FROM inventario_sucursal
-      WHERE id_sucursal = $1
-        AND id_producto = $2
-      FOR UPDATE
+        SELECT
+          id_inventario,
+          stock_actual,
+          ubicacion
+        FROM inventario_sucursal
+        WHERE id_sucursal = $1
+          AND id_producto = $2
+        FOR UPDATE
       `,
       [loteActual.id_sucursal, loteActual.id_producto]
     );
@@ -1088,30 +2232,65 @@ export const actualizarLote = async (req, res) => {
 
       return res.status(404).json({
         ok: false,
-        mensaje: 'No se encontró el inventario general asociado al lote',
+        mensaje:
+          'No se encontró el inventario general asociado al lote',
       });
     }
 
-    const inventarioActual = inventarioActualResultado.rows[0];
+    let inventarioVarianteActual = null;
+
+    if (loteActual.id_variante) {
+      const varianteResultado = await client.query(
+        `
+          SELECT *
+          FROM inventario_variantes_sucursal
+          WHERE id_sucursal = $1
+            AND id_producto = $2
+            AND id_variante = $3
+          FOR UPDATE
+        `,
+        [
+          loteActual.id_sucursal,
+          loteActual.id_producto,
+          loteActual.id_variante,
+        ]
+      );
+
+      if (varianteResultado.rows.length === 0) {
+        await client.query('ROLLBACK');
+
+        return res.status(404).json({
+          ok: false,
+          mensaje:
+            'No se encontró el inventario de la variante asociada al lote',
+        });
+      }
+
+      inventarioVarianteActual =
+        varianteResultado.rows[0];
+    }
+
+    const inventarioActual =
+      inventarioActualResultado.rows[0];
+
     const loteNormalizado = normalizarLote(lote);
 
     const loteDuplicado = await client.query(
       `
-      SELECT id_lote
-      FROM inventario_lotes
-      WHERE id_sucursal = $1
-        AND id_producto = $2
-        AND lote = $3
-        AND (
-          (fecha_caducidad = $4::date)
-          OR (fecha_caducidad IS NULL AND $4::date IS NULL)
-        )
-        AND id_lote <> $5
-      LIMIT 1
+        SELECT id_lote
+        FROM inventario_lotes
+        WHERE id_sucursal = $1
+          AND id_producto = $2
+          AND id_variante IS NOT DISTINCT FROM $3::integer
+          AND lote = $4
+          AND fecha_caducidad IS NOT DISTINCT FROM $5::date
+          AND id_lote <> $6
+        LIMIT 1
       `,
       [
         loteActual.id_sucursal,
         loteActual.id_producto,
+        loteActual.id_variante,
         loteNormalizado,
         fecha_caducidad || null,
         id_lote,
@@ -1124,16 +2303,20 @@ export const actualizarLote = async (req, res) => {
       return res.status(409).json({
         ok: false,
         mensaje:
-          'Ya existe otro lote con el mismo número y fecha de caducidad para este producto',
+          'Ya existe otro lote con el mismo número, variante y fecha de caducidad',
       });
     }
 
-    const stockAnteriorLote = Number(loteActual.stock_actual || 0);
+    const stockAnteriorLote = Number(
+      loteActual.stock_actual || 0
+    );
+
     const stockNuevoLote = seEnvioStock
       ? Number(stock_actual)
       : stockAnteriorLote;
 
-    const diferenciaStock = stockNuevoLote - stockAnteriorLote;
+    const diferenciaStock =
+      stockNuevoLote - stockAnteriorLote;
 
     const stockAnteriorInventario = Number(
       inventarioActual.stock_actual || 0
@@ -1148,16 +2331,35 @@ export const actualizarLote = async (req, res) => {
       return res.status(400).json({
         ok: false,
         mensaje:
-          'El ajuste dejaría el inventario general en un valor negativo. Revisa las existencias.',
+          'El ajuste dejaría el inventario general en un valor negativo.',
       });
     }
 
-    const ubicacionActualizada = Object.prototype.hasOwnProperty.call(
-      req.body,
-      'ubicacion'
-    )
-      ? String(ubicacion || '').trim() || null
-      : inventarioActual.ubicacion;
+    let stockNuevoVariante = null;
+
+    if (inventarioVarianteActual) {
+      stockNuevoVariante =
+        Number(inventarioVarianteActual.stock_actual || 0) +
+        diferenciaStock;
+
+      if (stockNuevoVariante < 0) {
+        await client.query('ROLLBACK');
+
+        return res.status(400).json({
+          ok: false,
+          mensaje:
+            'El ajuste dejaría la variante con stock negativo.',
+        });
+      }
+    }
+
+    const ubicacionActualizada =
+      Object.prototype.hasOwnProperty.call(
+        req.body,
+        'ubicacion'
+      )
+        ? normalizarTextoNullable(ubicacion)
+        : inventarioActual.ubicacion;
 
     const proveedorActualizado = id_proveedor
       ? Number(id_proveedor)
@@ -1165,86 +2367,117 @@ export const actualizarLote = async (req, res) => {
 
     const precioCompraActualizado =
       precio_compra !== '' &&
-        precio_compra !== null &&
-        precio_compra !== undefined
+      precio_compra !== null &&
+      precio_compra !== undefined
         ? Number(precio_compra)
         : 0;
 
-    const loteActualizadoResultado = await client.query(
-      `
-      UPDATE inventario_lotes
-      SET
-        id_proveedor = $1,
-        lote = $2,
-        fecha_caducidad = $3,
-        precio_compra = $4,
-        stock_actual = $5,
-        activo = CASE WHEN $5::numeric > 0 THEN true ELSE false END,
-        fecha_actualizacion = CURRENT_TIMESTAMP
-      WHERE id_lote = $6
-      RETURNING *
-      `,
-      [
-        proveedorActualizado,
-        loteNormalizado,
-        fecha_caducidad || null,
-        precioCompraActualizado,
-        stockNuevoLote,
-        id_lote,
-      ]
-    );
+    const loteActualizadoResultado =
+      await client.query(
+        `
+          UPDATE inventario_lotes
+          SET
+            id_proveedor = $1,
+            lote = $2,
+            fecha_caducidad = $3,
+            precio_compra = $4,
+            stock_actual = $5,
+            activo =
+              CASE WHEN $5::numeric > 0
+              THEN true ELSE false END,
+            fecha_actualizacion = CURRENT_TIMESTAMP
+          WHERE id_lote = $6
+          RETURNING *
+        `,
+        [
+          proveedorActualizado,
+          loteNormalizado,
+          fecha_caducidad || null,
+          precioCompraActualizado,
+          stockNuevoLote,
+          id_lote,
+        ]
+      );
 
-    const inventarioActualizadoResultado = await client.query(
-      `
-      UPDATE inventario_sucursal
-      SET
-        stock_actual = $1,
-        ubicacion = $2,
-        fecha_actualizacion = CURRENT_TIMESTAMP
-      WHERE id_sucursal = $3
-        AND id_producto = $4
-      RETURNING *
-      `,
-      [
-        stockNuevoInventario,
-        ubicacionActualizada,
-        loteActual.id_sucursal,
-        loteActual.id_producto,
-      ]
-    );
+    const inventarioActualizadoResultado =
+      await client.query(
+        `
+          UPDATE inventario_sucursal
+          SET
+            stock_actual = $1,
+            ubicacion = $2,
+            fecha_actualizacion = CURRENT_TIMESTAMP
+          WHERE id_sucursal = $3
+            AND id_producto = $4
+          RETURNING *
+        `,
+        [
+          stockNuevoInventario,
+          ubicacionActualizada,
+          loteActual.id_sucursal,
+          loteActual.id_producto,
+        ]
+      );
+
+    if (inventarioVarianteActual) {
+      await client.query(
+        `
+          UPDATE inventario_variantes_sucursal
+          SET
+            stock_actual = $1,
+            ubicacion = COALESCE($2, ubicacion),
+            activo = true,
+            fecha_actualizacion = CURRENT_TIMESTAMP
+          WHERE id_inventario_variante = $3
+        `,
+        [
+          stockNuevoVariante,
+          ubicacionActualizada,
+          inventarioVarianteActual.id_inventario_variante,
+        ]
+      );
+    }
 
     if (diferenciaStock !== 0) {
       const tipoMovimiento =
-        diferenciaStock > 0 ? 'AJUSTE_POSITIVO' : 'AJUSTE_NEGATIVO';
+        diferenciaStock > 0
+          ? 'AJUSTE_POSITIVO'
+          : 'AJUSTE_NEGATIVO';
 
       const observacionMovimiento = [
         `Edición manual del lote ${loteNormalizado}.`,
         `Stock del lote: ${stockAnteriorLote} → ${stockNuevoLote}.`,
-        observaciones ? `Motivo: ${String(observaciones).trim()}` : '',
+        observaciones
+          ? `Motivo: ${String(observaciones).trim()}`
+          : '',
       ]
         .filter(Boolean)
         .join(' ');
 
       await client.query(
         `
-        INSERT INTO inventario_movimientos (
-          id_sucursal,
-          id_producto,
-          id_lote,
-          id_proveedor,
-          tipo_movimiento,
-          cantidad,
-          stock_anterior,
-          stock_nuevo,
-          referencia,
-          observaciones,
-          id_usuario
-        )
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+          INSERT INTO inventario_movimientos (
+            id_sucursal,
+            id_producto,
+            id_variante,
+            id_lote,
+            id_proveedor,
+            tipo_movimiento,
+            cantidad,
+            stock_anterior,
+            stock_nuevo,
+            referencia,
+            observaciones,
+            id_usuario
+          )
+          VALUES (
+            $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12
+          )
         `,
         [
           loteActual.id_sucursal,
           loteActual.id_producto,
+          loteActual.id_variante || null,
           Number(id_lote),
           proveedorActualizado,
           tipoMovimiento,
@@ -1267,8 +2500,10 @@ export const actualizarLote = async (req, res) => {
           ? 'Lote actualizado y ajuste de inventario registrado correctamente'
           : 'Lote actualizado correctamente',
       lote: loteActualizadoResultado.rows[0],
-      inventario: inventarioActualizadoResultado.rows[0],
+      inventario:
+        inventarioActualizadoResultado.rows[0],
       diferencia_stock: diferenciaStock,
+      stock_variante: stockNuevoVariante,
     });
   } catch (error) {
     await client.query('ROLLBACK');
@@ -1298,31 +2533,49 @@ export const listarCaducidadProxima = async (req, res) => {
 
     const resultado = await pool.query(
       `
-      SELECT
-        il.id_lote,
-        il.id_sucursal,
-        s.nombre AS sucursal,
-        il.id_producto,
-        p.nombre AS producto,
-        p.codigo_barras,
-        il.lote,
-        il.fecha_caducidad,
-        il.stock_actual,
-        il.precio_compra,
-        il.activo,
-        il.fecha_entrada,
-        CASE
-          WHEN il.fecha_caducidad < CURRENT_DATE THEN 'CADUCADO'
-          ELSE 'POR_CADUCAR'
-        END AS estado_caducidad
-      FROM inventario_lotes il
-      INNER JOIN sucursales s ON s.id_sucursal = il.id_sucursal
-      INNER JOIN productos p ON p.id_producto = il.id_producto
-      WHERE il.id_sucursal = $1
-      AND il.stock_actual > 0
-      AND il.fecha_caducidad IS NOT NULL
-      AND il.fecha_caducidad <= CURRENT_DATE + ($2 || ' days')::INTERVAL
-      ORDER BY il.fecha_caducidad ASC
+        SELECT
+          il.id_lote,
+          il.id_sucursal,
+          s.nombre AS sucursal,
+          il.id_producto,
+          p.nombre AS producto,
+          p.codigo_barras,
+
+          il.id_variante,
+          pv.nombre_variante,
+          pv.sku,
+          pv.codigo_barras AS codigo_barras_variante,
+          pv.talla,
+          pv.color,
+          pv.tono,
+          pv.presentacion AS presentacion_variante,
+          COALESCE(pv.atributos, '{}'::jsonb) AS atributos,
+
+          il.lote,
+          il.fecha_caducidad,
+          il.stock_actual,
+          il.precio_compra,
+          il.activo,
+          il.fecha_entrada,
+
+          CASE
+            WHEN il.fecha_caducidad < CURRENT_DATE
+              THEN 'CADUCADO'
+            ELSE 'POR_CADUCAR'
+          END AS estado_caducidad
+        FROM inventario_lotes il
+        INNER JOIN sucursales s
+          ON s.id_sucursal = il.id_sucursal
+        INNER JOIN productos p
+          ON p.id_producto = il.id_producto
+        LEFT JOIN producto_variantes pv
+          ON pv.id_variante = il.id_variante
+        WHERE il.id_sucursal = $1
+          AND il.stock_actual > 0
+          AND il.fecha_caducidad IS NOT NULL
+          AND il.fecha_caducidad <=
+            CURRENT_DATE + ($2 || ' days')::INTERVAL
+        ORDER BY il.fecha_caducidad ASC
       `,
       [sucursal, dias]
     );
@@ -1333,11 +2586,16 @@ export const listarCaducidadProxima = async (req, res) => {
       productos_caducidad: resultado.rows,
     });
   } catch (error) {
-    console.error('Error al listar caducidad próxima:', error);
+    console.error(
+      'Error al listar caducidad próxima:',
+      error
+    );
 
     return res.status(500).json({
       ok: false,
-      mensaje: 'Error interno al listar productos por caducar',
+      mensaje:
+        'Error interno al listar productos por caducar',
+      error: error.message,
     });
   }
 };
@@ -1346,7 +2604,12 @@ export const bajaLotePorCaducidad = async (req, res) => {
   const client = await pool.connect();
 
   try {
-    const { id_sucursal, id_producto, id_lote, observaciones } = req.body;
+    const {
+      id_sucursal,
+      id_producto,
+      id_lote,
+      observaciones,
+    } = req.body;
 
     if (!id_sucursal || !id_producto || !id_lote) {
       return res.status(400).json({
@@ -1359,19 +2622,20 @@ export const bajaLotePorCaducidad = async (req, res) => {
 
     const loteResultado = await client.query(
       `
-      SELECT
-        id_lote,
-        id_sucursal,
-        id_producto,
-        lote,
-        fecha_caducidad,
-        stock_actual,
-        activo
-      FROM inventario_lotes
-      WHERE id_lote = $1
-      AND id_sucursal = $2
-      AND id_producto = $3
-      FOR UPDATE
+        SELECT
+          id_lote,
+          id_sucursal,
+          id_producto,
+          id_variante,
+          lote,
+          fecha_caducidad,
+          stock_actual,
+          activo
+        FROM inventario_lotes
+        WHERE id_lote = $1
+          AND id_sucursal = $2
+          AND id_producto = $3
+        FOR UPDATE
       `,
       [id_lote, id_sucursal, id_producto]
     );
@@ -1381,31 +2645,35 @@ export const bajaLotePorCaducidad = async (req, res) => {
 
       return res.status(404).json({
         ok: false,
-        mensaje: 'El lote no existe para esta sucursal y producto',
+        mensaje:
+          'El lote no existe para esta sucursal y producto',
       });
     }
 
-    const lote = loteResultado.rows[0];
-    const stockLote = Number(lote.stock_actual || 0);
+    const loteActual = loteResultado.rows[0];
+    const stockLote = Number(
+      loteActual.stock_actual || 0
+    );
 
     if (stockLote <= 0) {
       await client.query('ROLLBACK');
 
       return res.status(400).json({
         ok: false,
-        mensaje: 'El lote no tiene stock disponible para dar de baja',
+        mensaje:
+          'El lote no tiene stock disponible para dar de baja',
       });
     }
 
     const inventarioResultado = await client.query(
       `
-      SELECT
-        id_inventario,
-        stock_actual
-      FROM inventario_sucursal
-      WHERE id_sucursal = $1
-      AND id_producto = $2
-      FOR UPDATE
+        SELECT
+          id_inventario,
+          stock_actual
+        FROM inventario_sucursal
+        WHERE id_sucursal = $1
+          AND id_producto = $2
+        FOR UPDATE
       `,
       [id_sucursal, id_producto]
     );
@@ -1415,65 +2683,131 @@ export const bajaLotePorCaducidad = async (req, res) => {
 
       return res.status(404).json({
         ok: false,
-        mensaje: 'No existe inventario general para este producto en la sucursal',
+        mensaje:
+          'No existe inventario general para este producto en la sucursal',
       });
     }
 
-    const stockAnterior = Number(inventarioResultado.rows[0].stock_actual || 0);
-    const stockNuevo = Math.max(stockAnterior - stockLote, 0);
+    const stockAnterior = Number(
+      inventarioResultado.rows[0].stock_actual || 0
+    );
+
+    const stockNuevo = Math.max(
+      stockAnterior - stockLote,
+      0
+    );
+
+    let stockVarianteNuevo = null;
+
+    if (loteActual.id_variante) {
+      const varianteResultado = await client.query(
+        `
+          SELECT *
+          FROM inventario_variantes_sucursal
+          WHERE id_sucursal = $1
+            AND id_producto = $2
+            AND id_variante = $3
+          FOR UPDATE
+        `,
+        [
+          id_sucursal,
+          id_producto,
+          loteActual.id_variante,
+        ]
+      );
+
+      if (varianteResultado.rows.length === 0) {
+        await client.query('ROLLBACK');
+
+        return res.status(404).json({
+          ok: false,
+          mensaje:
+            'No existe inventario para la variante asociada al lote',
+        });
+      }
+
+      const stockVarianteAnterior = Number(
+        varianteResultado.rows[0].stock_actual || 0
+      );
+
+      stockVarianteNuevo = Math.max(
+        stockVarianteAnterior - stockLote,
+        0
+      );
+
+      await client.query(
+        `
+          UPDATE inventario_variantes_sucursal
+          SET
+            stock_actual = $1,
+            activo = true,
+            fecha_actualizacion = CURRENT_TIMESTAMP
+          WHERE id_inventario_variante = $2
+        `,
+        [
+          stockVarianteNuevo,
+          varianteResultado.rows[0]
+            .id_inventario_variante,
+        ]
+      );
+    }
 
     await client.query(
       `
-      UPDATE inventario_lotes
-      SET
-        stock_actual = 0,
-        activo = false,
-        fecha_actualizacion = CURRENT_TIMESTAMP
-      WHERE id_lote = $1
+        UPDATE inventario_lotes
+        SET
+          stock_actual = 0,
+          activo = false,
+          fecha_actualizacion = CURRENT_TIMESTAMP
+        WHERE id_lote = $1
       `,
       [id_lote]
     );
 
     const inventarioActualizado = await client.query(
       `
-      UPDATE inventario_sucursal
-      SET
-        stock_actual = $1,
-        fecha_actualizacion = CURRENT_TIMESTAMP
-      WHERE id_sucursal = $2
-      AND id_producto = $3
-      RETURNING *
+        UPDATE inventario_sucursal
+        SET
+          stock_actual = $1,
+          fecha_actualizacion = CURRENT_TIMESTAMP
+        WHERE id_sucursal = $2
+          AND id_producto = $3
+        RETURNING *
       `,
       [stockNuevo, id_sucursal, id_producto]
     );
 
     const movimiento = await client.query(
       `
-      INSERT INTO inventario_movimientos (
-        id_sucursal,
-        id_producto,
-        id_lote,
-        tipo_movimiento,
-        cantidad,
-        stock_anterior,
-        stock_nuevo,
-        referencia,
-        observaciones,
-        id_usuario
-      )
-      VALUES ($1,$2,$3,'CADUCIDAD',$4,$5,$6,$7,$8,$9)
-      RETURNING *
+        INSERT INTO inventario_movimientos (
+          id_sucursal,
+          id_producto,
+          id_variante,
+          id_lote,
+          tipo_movimiento,
+          cantidad,
+          stock_anterior,
+          stock_nuevo,
+          referencia,
+          observaciones,
+          id_usuario
+        )
+        VALUES (
+          $1,$2,$3,$4,'CADUCIDAD',$5,$6,$7,$8,$9,$10
+        )
+        RETURNING *
       `,
       [
         id_sucursal,
         id_producto,
+        loteActual.id_variante || null,
         id_lote,
         stockLote,
         stockAnterior,
         stockNuevo,
-        `CADUCIDAD-${lote.lote}`,
+        `CADUCIDAD-${loteActual.lote}`,
         observaciones ||
-        `Baja por caducidad del lote ${lote.lote}`,
+          `Baja por caducidad del lote ${loteActual.lote}`,
         req.usuario?.id_usuario || null,
       ]
     );
@@ -1482,22 +2816,29 @@ export const bajaLotePorCaducidad = async (req, res) => {
 
     return res.json({
       ok: true,
-      mensaje: 'Lote dado de baja por caducidad correctamente',
+      mensaje:
+        'Lote dado de baja por caducidad correctamente',
       lote: {
-        ...lote,
+        ...loteActual,
         stock_baja: stockLote,
       },
       inventario: inventarioActualizado.rows[0],
       movimiento: movimiento.rows[0],
+      stock_variante: stockVarianteNuevo,
     });
   } catch (error) {
     await client.query('ROLLBACK');
 
-    console.error('Error al dar de baja lote por caducidad:', error);
+    console.error(
+      'Error al dar de baja lote por caducidad:',
+      error
+    );
 
     return res.status(500).json({
       ok: false,
-      mensaje: 'Error interno al dar de baja lote por caducidad',
+      mensaje:
+        'Error interno al dar de baja lote por caducidad',
+      error: error.message,
     });
   } finally {
     client.release();
@@ -1527,9 +2868,31 @@ export const consultarStockSucursales = async (req, res) => {
       ''
     ).trim();
 
-    const esBusquedaSugerencias = modo === 'sugerencias';
+    const esBusquedaSugerencias =
+      modo === 'sugerencias';
 
-    
+    const selectProductoBase = `
+      SELECT
+        p.id_producto,
+        p.codigo_barras,
+        p.nombre,
+        p.descripcion,
+        p.id_marca,
+        m.nombre AS marca,
+        p.presentacion,
+        c.nombre AS categoria,
+        p.precio_venta,
+        p.usa_variantes,
+        p.configuracion_variantes,
+        p.controla_lotes,
+        p.controla_caducidad
+      FROM productos p
+      LEFT JOIN categorias c
+        ON c.id_categoria = p.id_categoria
+      LEFT JOIN marcas m
+        ON m.id_marca = p.id_marca
+    `;
+
     if (esBusquedaSugerencias) {
       if (textoBusqueda.length < 2) {
         return res.json({
@@ -1542,44 +2905,38 @@ export const consultarStockSucursales = async (req, res) => {
 
       const sugerenciasResultado = await pool.query(
         `
-        SELECT
-          p.id_producto,
-          p.codigo_barras,
-          p.nombre,
-          p.descripcion,
-          p.id_marca,
-          m.nombre AS marca,
-          p.presentacion,
-          c.nombre AS categoria,
-          p.precio_venta,
-          p.usa_variantes,
-          p.controla_lotes,
-          p.controla_caducidad
-        FROM productos p
-        LEFT JOIN categorias c
-          ON c.id_categoria = p.id_categoria
-        LEFT JOIN marcas m
-          ON m.id_marca = p.id_marca
-        WHERE p.activo = true
-          AND (
-            p.nombre ILIKE $1
-            OR p.codigo_barras ILIKE $1
-            OR p.descripcion ILIKE $1
-            OR m.nombre ILIKE $1
-            OR p.presentacion ILIKE $1
-          )
-        ORDER BY
-          CASE
-            WHEN p.codigo_barras = $2 THEN 0
-            WHEN LOWER(p.nombre) = LOWER($2) THEN 1
-            WHEN p.nombre ILIKE $1 THEN 2
-            WHEN p.descripcion ILIKE $1 THEN 3
-            WHEN p.presentacion ILIKE $1 THEN 4
-            WHEN m.nombre ILIKE $1 THEN 5
-            ELSE 6
-          END,
-          p.nombre ASC
-        LIMIT 10
+          ${selectProductoBase}
+          WHERE p.activo = true
+            AND (
+              p.nombre ILIKE $1
+              OR p.codigo_barras ILIKE $1
+              OR p.descripcion ILIKE $1
+              OR m.nombre ILIKE $1
+              OR p.presentacion ILIKE $1
+              OR EXISTS (
+                SELECT 1
+                FROM producto_variantes pv
+                WHERE pv.id_producto = p.id_producto
+                  AND pv.activo = true
+                  AND (
+                    pv.nombre_variante ILIKE $1
+                    OR pv.sku ILIKE $1
+                    OR pv.codigo_barras ILIKE $1
+                    OR pv.talla ILIKE $1
+                    OR pv.color ILIKE $1
+                    OR pv.tono ILIKE $1
+                  )
+              )
+            )
+          ORDER BY
+            CASE
+              WHEN p.codigo_barras = $2 THEN 0
+              WHEN LOWER(p.nombre) = LOWER($2) THEN 1
+              WHEN p.nombre ILIKE $1 THEN 2
+              ELSE 3
+            END,
+            p.nombre ASC
+          LIMIT 10
         `,
         [texto, textoBusqueda]
       );
@@ -1592,7 +2949,6 @@ export const consultarStockSucursales = async (req, res) => {
 
     let productoResultado;
 
-    
     if (id_producto !== '') {
       const idProducto = Number(id_producto);
 
@@ -1605,27 +2961,10 @@ export const consultarStockSucursales = async (req, res) => {
 
       productoResultado = await pool.query(
         `
-        SELECT
-          p.id_producto,
-          p.codigo_barras,
-          p.nombre,
-          p.descripcion,
-          p.id_marca,
-          m.nombre AS marca,
-          p.presentacion,
-          c.nombre AS categoria,
-          p.precio_venta,
-          p.usa_variantes,
-          p.controla_lotes,
-          p.controla_caducidad
-        FROM productos p
-        LEFT JOIN categorias c
-          ON c.id_categoria = p.id_categoria
-        LEFT JOIN marcas m
-          ON m.id_marca = p.id_marca
-        WHERE p.activo = true
-          AND p.id_producto = $1
-        LIMIT 1
+          ${selectProductoBase}
+          WHERE p.activo = true
+            AND p.id_producto = $1
+          LIMIT 1
         `,
         [idProducto]
       );
@@ -1642,44 +2981,38 @@ export const consultarStockSucursales = async (req, res) => {
 
       productoResultado = await pool.query(
         `
-        SELECT
-          p.id_producto,
-          p.codigo_barras,
-          p.nombre,
-          p.descripcion,
-          p.id_marca,
-          m.nombre AS marca,
-          p.presentacion,
-          c.nombre AS categoria,
-          p.precio_venta,
-          p.usa_variantes,
-          p.controla_lotes,
-          p.controla_caducidad
-        FROM productos p
-        LEFT JOIN categorias c
-          ON c.id_categoria = p.id_categoria
-        LEFT JOIN marcas m
-          ON m.id_marca = p.id_marca
-        WHERE p.activo = true
-          AND (
-            p.nombre ILIKE $1
-            OR p.codigo_barras ILIKE $1
-            OR p.descripcion ILIKE $1
-            OR m.nombre ILIKE $1
-            OR p.presentacion ILIKE $1
-          )
-        ORDER BY
-          CASE
-            WHEN p.codigo_barras = $2 THEN 0
-            WHEN LOWER(p.nombre) = LOWER($2) THEN 1
-            WHEN p.nombre ILIKE $1 THEN 2
-            WHEN p.descripcion ILIKE $1 THEN 3
-            WHEN p.presentacion ILIKE $1 THEN 4
-            WHEN m.nombre ILIKE $1 THEN 5
-            ELSE 6
-          END,
-          p.nombre ASC
-        LIMIT 1
+          ${selectProductoBase}
+          WHERE p.activo = true
+            AND (
+              p.nombre ILIKE $1
+              OR p.codigo_barras ILIKE $1
+              OR p.descripcion ILIKE $1
+              OR m.nombre ILIKE $1
+              OR p.presentacion ILIKE $1
+              OR EXISTS (
+                SELECT 1
+                FROM producto_variantes pv
+                WHERE pv.id_producto = p.id_producto
+                  AND pv.activo = true
+                  AND (
+                    pv.nombre_variante ILIKE $1
+                    OR pv.sku ILIKE $1
+                    OR pv.codigo_barras ILIKE $1
+                    OR pv.talla ILIKE $1
+                    OR pv.color ILIKE $1
+                    OR pv.tono ILIKE $1
+                  )
+              )
+            )
+          ORDER BY
+            CASE
+              WHEN p.codigo_barras = $2 THEN 0
+              WHEN LOWER(p.nombre) = LOWER($2) THEN 1
+              WHEN p.nombre ILIKE $1 THEN 2
+              ELSE 3
+            END,
+            p.nombre ASC
+          LIMIT 1
         `,
         [texto, textoBusqueda]
       );
@@ -1697,27 +3030,61 @@ export const consultarStockSucursales = async (req, res) => {
 
     const sucursalesResultado = await pool.query(
       `
-      SELECT
-        s.id_sucursal,
-        s.nombre AS sucursal,
-        s.direccion,
-        COALESCE(i.stock_actual, 0) AS stock,
-        COALESCE(i.stock_minimo, 0) AS stock_minimo,
-        i.ubicacion,
-        i.fecha_actualizacion,
-        CASE
-          WHEN COALESCE(i.stock_actual, 0) <= 0 THEN 'SIN_STOCK'
-          WHEN COALESCE(i.stock_actual, 0) <= COALESCE(i.stock_minimo, 0) THEN 'STOCK_BAJO'
-          ELSE 'DISPONIBLE'
-        END AS estado
-      FROM sucursales s
-      LEFT JOIN inventario_sucursal i
-        ON i.id_sucursal = s.id_sucursal
-       AND i.id_producto = $1
-      WHERE s.activo = true
-      ORDER BY
-        COALESCE(i.stock_actual, 0) DESC,
-        s.nombre ASC
+        SELECT
+          s.id_sucursal,
+          s.nombre AS sucursal,
+          s.direccion,
+          COALESCE(i.stock_actual, 0) AS stock,
+          COALESCE(i.stock_minimo, 0) AS stock_minimo,
+          i.ubicacion,
+          i.fecha_actualizacion,
+
+          COALESCE(
+            (
+              SELECT jsonb_agg(
+                jsonb_build_object(
+                  'id_variante', pv.id_variante,
+                  'nombre_variante', pv.nombre_variante,
+                  'sku', pv.sku,
+                  'codigo_barras', pv.codigo_barras,
+                  'talla', pv.talla,
+                  'color', pv.color,
+                  'tono', pv.tono,
+                  'presentacion', pv.presentacion,
+                  'atributos', COALESCE(pv.atributos, '{}'::jsonb),
+                  'stock_actual', ivs.stock_actual,
+                  'stock_minimo', ivs.stock_minimo,
+                  'ubicacion', ivs.ubicacion
+                )
+                ORDER BY pv.nombre_variante, pv.id_variante
+              )
+              FROM inventario_variantes_sucursal ivs
+              INNER JOIN producto_variantes pv
+                ON pv.id_variante = ivs.id_variante
+              WHERE ivs.id_sucursal = s.id_sucursal
+                AND ivs.id_producto = $1
+                AND ivs.activo = true
+                AND pv.activo = true
+            ),
+            '[]'::jsonb
+          ) AS variantes,
+
+          CASE
+            WHEN COALESCE(i.stock_actual, 0) <= 0
+              THEN 'SIN_STOCK'
+            WHEN COALESCE(i.stock_actual, 0) <=
+              COALESCE(i.stock_minimo, 0)
+              THEN 'STOCK_BAJO'
+            ELSE 'DISPONIBLE'
+          END AS estado
+        FROM sucursales s
+        LEFT JOIN inventario_sucursal i
+          ON i.id_sucursal = s.id_sucursal
+         AND i.id_producto = $1
+        WHERE s.activo = true
+        ORDER BY
+          COALESCE(i.stock_actual, 0) DESC,
+          s.nombre ASC
       `,
       [producto.id_producto]
     );
@@ -1736,6 +3103,8 @@ export const consultarStockSucursales = async (req, res) => {
       categoria: producto.categoria,
       precio_venta: producto.precio_venta,
       usa_variantes: producto.usa_variantes,
+      configuracion_variantes:
+        producto.configuracion_variantes,
       controla_lotes: producto.controla_lotes,
       controla_caducidad: producto.controla_caducidad,
 
@@ -1750,6 +3119,7 @@ export const consultarStockSucursales = async (req, res) => {
       ubicacion: sucursal.ubicacion,
       estado: sucursal.estado,
       fecha_actualizacion: sucursal.fecha_actualizacion,
+      variantes: sucursal.variantes || [],
 
       lote: null,
       fecha_caducidad: null,
@@ -1763,11 +3133,13 @@ export const consultarStockSucursales = async (req, res) => {
         descripcion: producto.descripcion,
         codigo_barras: producto.codigo_barras,
         id_marca: producto.id_marca,
-      marca: producto.marca,
+        marca: producto.marca,
         presentacion: producto.presentacion,
         categoria: producto.categoria,
         precio_venta: producto.precio_venta,
         usa_variantes: producto.usa_variantes,
+        configuracion_variantes:
+          producto.configuracion_variantes,
         controla_lotes: producto.controla_lotes,
         controla_caducidad: producto.controla_caducidad,
       },
@@ -1775,12 +3147,17 @@ export const consultarStockSucursales = async (req, res) => {
       productos,
     });
   } catch (error) {
-    console.error('Error al consultar stock en sucursales:', error);
+    console.error(
+      'Error al consultar stock en sucursales:',
+      error
+    );
 
     return res.status(500).json({
       ok: false,
-      mensaje: 'Error interno al consultar stock en sucursales',
+      mensaje:
+        'Error interno al consultar stock en sucursales',
       error: error.message,
     });
   }
 };
+

@@ -7,39 +7,6 @@ import { pool } from '../config/db.js';
 const REPORTES_CAJA_DIR = path.join(process.cwd(), 'uploads', 'reportes-caja');
 
 
-const LOGO_SHADDAI_PATHS = [
-  path.join(process.cwd(), 'src', 'assets', 'logoShaddai.png'),
-  path.join(process.cwd(), 'assets', 'logoShaddai.png'),
-  path.join(process.cwd(), 'backend', 'src', 'assets', 'logoShaddai.png'),
-];
-
-const obtenerLogoReporteBase64 = async () => {
-  for (const rutaLogo of LOGO_SHADDAI_PATHS) {
-    try {
-      const bufferLogo = await fs.readFile(rutaLogo);
-      const extension = path.extname(rutaLogo).toLowerCase();
-
-      const mimeType =
-        extension === '.jpg' || extension === '.jpeg'
-          ? 'image/jpeg'
-          : extension === '.webp'
-            ? 'image/webp'
-            : 'image/png';
-
-      return `data:${mimeType};base64,${bufferLogo.toString('base64')}`;
-    } catch {
-
-    }
-  }
-
-  console.warn(
-    'No se encontró el logo para el reporte PDF. Rutas revisadas:',
-    LOGO_SHADDAI_PATHS
-  );
-
-  return null;
-};
-
 const formatoMonedaMXN = (valor) => {
   return Number(valor || 0).toLocaleString('es-MX', {
     style: 'currency',
@@ -108,6 +75,51 @@ const formatearPagosReporte = (venta) => {
 
   return normalizarMetodoPagoReporte(venta?.metodo_pago);
 };
+
+
+const parsearAtributosVarianteReporte = (valor) => {
+  if (!valor) return {};
+  if (typeof valor === 'object' && !Array.isArray(valor)) return valor;
+
+  if (typeof valor === 'string') {
+    try {
+      const parsed = JSON.parse(valor);
+      return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+        ? parsed
+        : {};
+    } catch {
+      return {};
+    }
+  }
+
+  return {};
+};
+
+const obtenerDescripcionVarianteReporte = (item = {}) => {
+  if (!item?.id_variante) return '—';
+
+  const nombreVariante = String(item.nombre_variante || '').trim();
+  if (nombreVariante) return nombreVariante;
+
+  const atributos = parsearAtributosVarianteReporte(item.atributos_variante);
+  const valores = [
+    item.talla,
+    item.color,
+    item.tono,
+    item.presentacion_variante,
+    ...Object.values(atributos),
+  ]
+    .map((valor) => String(valor ?? '').trim())
+    .filter(Boolean);
+
+  return [...new Set(valores)].join(' · ') || `Variante #${item.id_variante}`;
+};
+
+const obtenerCodigoVarianteReporte = (item = {}) =>
+  item.sku_variante ||
+  item.codigo_barras_variante ||
+  item.codigo_barras_producto ||
+  '—';
 
 const obtenerDatosReporteCierreCaja = async (idSesion) => {
   const sesionResultado = await pool.query(
@@ -260,64 +272,95 @@ const obtenerDatosReporteCierreCaja = async (idSesion) => {
   );
 
 
-  const serviciosResultado = await pool.query(
-    `
-    SELECT
-      v.id_venta,
-      v.folio AS folio_venta,
-      v.fecha_venta,
-      v.metodo_pago,
-      v.total AS total_venta,
+  // El detalle por variante es informativo para el reporte. No debe impedir
+  // que se genere el corte si una instalación todavía tiene un esquema previo.
+  // to_jsonb(alias)->>'campo' permite leer columnas opcionales sin provocar
+  // error SQL cuando una columna aún no existe en una versión antigua.
+  let detalleProductosResultado = { rows: [] };
 
-      vsd.id_venta_servicio,
-      vsd.id_solicitud_servicio,
-      vsd.id_detalle_servicio,
-      vsd.id_servicio,
-      vsd.folio_servicio,
-      vsd.nombre_paciente,
-      vsd.nombre_servicio,
-      vsd.cantidad,
-      vsd.precio_unitario,
-      vsd.subtotal,
-
-      scs.estatus AS estatus_servicio,
-
-      dsp.nombre_completo AS doctor_shaddai
-    FROM venta_servicios_detalle vsd
-    INNER JOIN ventas v
-      ON v.id_venta = vsd.id_venta
-    LEFT JOIN servicios_clinicos_solicitudes scs
-      ON scs.id_solicitud_servicio = vsd.id_solicitud_servicio
-    LEFT JOIN LATERAL (
+  try {
+    detalleProductosResultado = await pool.query(
+      `
       SELECT
-        d.nombre_completo
-      FROM doctores_shaddai_perfiles d
-      WHERE d.id_perfil = scs.id_doctor
-         OR d.id_usuario = scs.id_doctor
-      ORDER BY d.id_perfil ASC
-      LIMIT 1
-    ) dsp ON true
-    WHERE v.id_sesion = $1
-      AND v.estado = 'COMPLETADA'
-    ORDER BY v.fecha_venta ASC, vsd.id_venta_servicio ASC
-    `,
-    [idSesion]
-  );
+        v.id_venta,
+        v.folio AS folio_venta,
+        v.fecha_venta,
+        vd.id_detalle,
+        vd.id_producto,
+        NULLIF(to_jsonb(vd)->>'id_variante', '')::integer AS id_variante,
+        p.nombre AS producto,
+        to_jsonb(p)->>'codigo_barras' AS codigo_barras_producto,
+        to_jsonb(pv)->>'nombre_variante' AS nombre_variante,
+        to_jsonb(pv)->>'sku' AS sku_variante,
+        to_jsonb(pv)->>'codigo_barras' AS codigo_barras_variante,
+        to_jsonb(pv)->>'talla' AS talla,
+        to_jsonb(pv)->>'color' AS color,
+        to_jsonb(pv)->>'tono' AS tono,
+        to_jsonb(pv)->>'presentacion' AS presentacion_variante,
+        COALESCE(to_jsonb(pv)->'atributos', '{}'::jsonb) AS atributos_variante,
+        NULLIF(to_jsonb(vd)->>'id_lote', '')::integer AS id_lote,
+        to_jsonb(il)->>'lote' AS lote,
+        to_jsonb(il)->>'fecha_caducidad' AS fecha_caducidad,
+        vd.cantidad,
+        vd.precio_unitario,
+        vd.subtotal
+      FROM venta_detalle vd
+      INNER JOIN ventas v ON v.id_venta = vd.id_venta
+      INNER JOIN productos p ON p.id_producto = vd.id_producto
+      LEFT JOIN producto_variantes pv
+        ON pv.id_variante = NULLIF(to_jsonb(vd)->>'id_variante', '')::integer
+      LEFT JOIN inventario_lotes il
+        ON il.id_lote = NULLIF(to_jsonb(vd)->>'id_lote', '')::integer
+      WHERE v.id_sesion = $1
+        AND v.estado = 'COMPLETADA'
+      ORDER BY v.fecha_venta ASC, v.id_venta ASC, vd.id_detalle ASC
+      `,
+      [idSesion]
+    );
+  } catch (errorDetalleProductos) {
+    console.error(
+      'No se pudo cargar el detalle de variantes para el reporte de caja. Se generará el reporte con el resumen disponible:',
+      errorDetalleProductos
+    );
 
-  const resumenServiciosResultado = await pool.query(
-    `
-    SELECT
-      COUNT(*)::int AS total_servicios,
-      COALESCE(SUM(vsd.cantidad), 0)::numeric(12,2) AS cantidad_servicios,
-      COALESCE(SUM(vsd.subtotal), 0)::numeric(12,2) AS total_servicios_clinicos
-    FROM venta_servicios_detalle vsd
-    INNER JOIN ventas v
-      ON v.id_venta = vsd.id_venta
-    WHERE v.id_sesion = $1
-      AND v.estado = 'COMPLETADA'
-    `,
-    [idSesion]
-  );
+    // Fallback mínimo: conserva el detalle de la venta aunque no pueda leer
+    // producto_variantes o inventario_lotes. Así el PDF nunca se pierde por
+    // una diferencia de esquema en la parte informativa.
+    detalleProductosResultado = await pool.query(
+      `
+      SELECT
+        v.id_venta,
+        v.folio AS folio_venta,
+        v.fecha_venta,
+        vd.id_detalle,
+        vd.id_producto,
+        NULL::integer AS id_variante,
+        p.nombre AS producto,
+        to_jsonb(p)->>'codigo_barras' AS codigo_barras_producto,
+        NULL::text AS nombre_variante,
+        NULL::text AS sku_variante,
+        NULL::text AS codigo_barras_variante,
+        NULL::text AS talla,
+        NULL::text AS color,
+        NULL::text AS tono,
+        NULL::text AS presentacion_variante,
+        '{}'::jsonb AS atributos_variante,
+        NULLIF(to_jsonb(vd)->>'id_lote', '')::integer AS id_lote,
+        NULL::text AS lote,
+        NULL::text AS fecha_caducidad,
+        vd.cantidad,
+        vd.precio_unitario,
+        vd.subtotal
+      FROM venta_detalle vd
+      INNER JOIN ventas v ON v.id_venta = vd.id_venta
+      INNER JOIN productos p ON p.id_producto = vd.id_producto
+      WHERE v.id_sesion = $1
+        AND v.estado = 'COMPLETADA'
+      ORDER BY v.fecha_venta ASC, v.id_venta ASC, vd.id_detalle ASC
+      `,
+      [idSesion]
+    );
+  }
 
   const movimientosResultado = await pool.query(
     `
@@ -365,12 +408,7 @@ const obtenerDatosReporteCierreCaja = async (idSesion) => {
     resumen,
     ventas: ventasResultado.rows,
     productos: productosResultado.rows,
-    servicios: serviciosResultado.rows,
-    resumen_servicios: resumenServiciosResultado.rows[0] || {
-      total_servicios: 0,
-      cantidad_servicios: 0,
-      total_servicios_clinicos: 0,
-    },
+    detalle_productos: detalleProductosResultado.rows,
     movimientos: movimientosResultado.rows,
     desglose: movimientosAgrupados,
     reporte_pdf: reportePdfResultado.rows[0] || null,
@@ -382,10 +420,8 @@ const construirHtmlReporteCierreCaja = ({
   resumen,
   ventas,
   productos,
-  servicios = [],
-  resumen_servicios = {},
+  detalle_productos = [],
   movimientos,
-  logoBase64,
 }) => {
   const ventasPuntos = Number(resumen.ventas_puntos || resumen.ventas_puntos_canjeados || 0);
   const puntosGanados = Number(resumen.puntos_ganados || 0);
@@ -395,26 +431,6 @@ const construirHtmlReporteCierreCaja = ({
     Number(resumen.retiros_efectivo || 0) +
     Number(resumen.pagos_proveedor_efectivo || 0);
   const diferencia = Number(resumen.diferencia || sesion.diferencia || 0);
-
-
-  const totalServiciosClinicos = Number(
-    resumen_servicios.total_servicios_clinicos || 0
-  );
-
-  const filasServicios = servicios.length
-    ? servicios.map((servicio) => `
-      <tr>
-        <td>${escapeHtml(servicio.folio_venta || '—')}</td>
-        <td>${escapeHtml(servicio.folio_servicio || '—')}</td>
-        <td>${escapeHtml(servicio.nombre_paciente || '—')}</td>
-        <td>${escapeHtml(servicio.nombre_servicio || '—')}</td>
-        <td class="right strong">${escapeHtml(servicio.cantidad || 0)}</td>
-        <td class="right strong">${escapeHtml(formatoMonedaMXN(servicio.precio_unitario))}</td>
-        <td class="right strong">${escapeHtml(formatoMonedaMXN(servicio.subtotal))}</td>
-        <td>${escapeHtml(servicio.doctor_shaddai || '—')}</td>
-      </tr>
-    `).join('')
-    : '<tr><td colspan="8" class="empty">No hay servicios clínicos cobrados.</td></tr>';
 
   const filasVentas = ventas.length
     ? ventas.map((venta) => `
@@ -437,6 +453,30 @@ const construirHtmlReporteCierreCaja = ({
       </tr>
     `).join('')
     : '<tr><td colspan="3" class="empty">No hay productos vendidos.</td></tr>';
+
+  const filasDetalleProductos = detalle_productos.length
+    ? detalle_productos.map((item) => {
+        const variante = obtenerDescripcionVarianteReporte(item);
+        const productoConVariante = item.id_variante
+          ? `${item.producto || 'Producto'} · ${variante}`
+          : item.producto || '—';
+
+        return `
+          <tr>
+            <td>${escapeHtml(item.folio_venta || '—')}</td>
+            <td>
+              <strong>${escapeHtml(productoConVariante)}</strong>
+              ${item.id_variante ? `<div class="muted">Variante #${escapeHtml(item.id_variante)}</div>` : ''}
+            </td>
+            <td>${escapeHtml(obtenerCodigoVarianteReporte(item))}</td>
+            <td>${escapeHtml(item.lote || 'Sin lote')}</td>
+            <td class="right strong">${escapeHtml(item.cantidad || 0)}</td>
+            <td class="right">${escapeHtml(formatoMonedaMXN(item.precio_unitario))}</td>
+            <td class="right strong">${escapeHtml(formatoMonedaMXN(item.subtotal))}</td>
+          </tr>
+        `;
+      }).join('')
+    : '<tr><td colspan="7" class="empty">No hay detalle de productos vendidos.</td></tr>';
 
   const filasMovimientos = movimientos.length
     ? movimientos.map((movimiento) => `
@@ -461,53 +501,30 @@ const construirHtmlReporteCierreCaja = ({
         body {
           margin: 0;
           font-family: Arial, Helvetica, sans-serif;
-          color: #0f172a;
+          color: #43353A;
           background: #ffffff;
           font-size: 11px;
         }
         .page { padding: 26px; }
         .header {
-          background: linear-gradient(135deg, #0369a1, #0ea5e9);
+          background: linear-gradient(135deg, #A95270 0%, #B85F7D 48%, #D58AA2 100%);
           color: white;
           border-radius: 18px;
-          padding: 24px;
+          padding: 24px 26px;
           margin-bottom: 18px;
+          box-shadow: 0 10px 26px rgba(184,95,125,.18);
         }
         .header-row { display: flex; justify-content: space-between; align-items: center; gap: 24px; }
-        .brand-block { display: flex; align-items: center; gap: 16px; min-width: 0; }
-        .logo-wrap {
-          width: 72px;
-          height: 72px;
-          border-radius: 18px;
-          background: rgba(255,255,255,.95);
-          border: 1px solid rgba(255,255,255,.65);
-          display: flex;
-          align-items: center;
-          justify-content: center;
-          padding: 8px;
-          flex: 0 0 auto;
+        .brand-block { min-width: 0; }
+        .brand {
+          display: inline-block;
+          font-size: 11px;
+          font-weight: 800;
+          letter-spacing: .14em;
+          text-transform: uppercase;
+          opacity: .92;
+          margin-bottom: 3px;
         }
-        .logo-wrap img {
-          max-width: 100%;
-          max-height: 100%;
-          object-fit: contain;
-          display: block;
-        }
-        .logo-fallback {
-          width: 72px;
-          height: 72px;
-          border-radius: 18px;
-          background: rgba(255,255,255,.2);
-          border: 1px solid rgba(255,255,255,.4);
-          display: flex;
-          align-items: center;
-          justify-content: center;
-          font-size: 22px;
-          font-weight: 900;
-          letter-spacing: .04em;
-          flex: 0 0 auto;
-        }
-        .brand { font-size: 13px; font-weight: 700; opacity: .95; }
         h1 { margin: 5px 0 6px; font-size: 27px; line-height: 1.1; }
         .subtitle { margin: 0; opacity: .92; }
         .badge {
@@ -525,7 +542,7 @@ const construirHtmlReporteCierreCaja = ({
         .grid-5 { grid-template-columns: repeat(5, 1fr); }
         .grid-6 { grid-template-columns: repeat(4, 1fr); }
         .card {
-          border: 1px solid #e2e8f0;
+          border: 1px solid #EEDFE4;
           border-radius: 14px;
           padding: 12px;
           background: #ffffff;
@@ -533,22 +550,22 @@ const construirHtmlReporteCierreCaja = ({
         .metric {
           border-radius: 14px;
           padding: 12px;
-          border: 1px solid #bae6fd;
-          background: #f0f9ff;
+          border: 1px solid #F0D4DE;
+          background: #FFF2F5;
         }
         .label {
           font-size: 9px;
           text-transform: uppercase;
           letter-spacing: .04em;
-          color: #64748b;
+          color: #8C777F;
           font-weight: 800;
           margin-bottom: 5px;
         }
         .value { font-size: 13px; font-weight: 800; word-break: break-word; }
-        .metric .value { font-size: 16px; color: #0369a1; }
+        .metric .value { font-size: 16px; color: #A84E6C; }
         .conciliation {
-          background: #f8fafc;
-          border: 1px solid #e2e8f0;
+          background: #FFFAFB;
+          border: 1px solid #EEDFE4;
           border-radius: 16px;
           padding: 12px;
           margin-top: 14px;
@@ -559,14 +576,14 @@ const construirHtmlReporteCierreCaja = ({
         table {
           width: 100%;
           border-collapse: collapse;
-          border: 1px solid #e2e8f0;
+          border: 1px solid #EEDFE4;
           border-radius: 12px;
           overflow: hidden;
           margin-bottom: 12px;
         }
         th {
-          background: #f1f5f9;
-          color: #475569;
+          background: #F8EDF1;
+          color: #766168;
           text-transform: uppercase;
           font-size: 9px;
           letter-spacing: .04em;
@@ -574,17 +591,18 @@ const construirHtmlReporteCierreCaja = ({
           text-align: left;
         }
         td {
-          border-top: 1px solid #e2e8f0;
+          border-top: 1px solid #F0E4E8;
           padding: 8px;
           vertical-align: top;
-          color: #334155;
+          color: #66535A;
         }
         .right { text-align: right; }
         .strong { font-weight: 800; }
-        .empty { text-align: center; color: #64748b; padding: 18px; }
+        .muted { color: #8C777F; font-size: 8px; margin-top: 2px; }
+        .empty { text-align: center; color: #8C777F; padding: 18px; }
         .total-box {
-          background: #f0f9ff;
-          border: 2px solid #bae6fd;
+          background: #FFF5F7;
+          border: 2px solid #F0D4DE;
           border-radius: 16px;
           padding: 14px;
           margin-top: 8px;
@@ -592,14 +610,14 @@ const construirHtmlReporteCierreCaja = ({
         .total-row {
           display: flex;
           justify-content: space-between;
-          border-bottom: 1px solid #bae6fd;
+          border-bottom: 1px solid #E8C3CF;
           padding: 6px 0;
           gap: 16px;
         }
         .total-row:last-child { border-bottom: 0; }
         .danger { color: #b91c1c; }
         .footer {
-          color: #64748b;
+          color: #8C777F;
           font-size: 9px;
           text-align: center;
           margin-top: 18px;
@@ -612,14 +630,9 @@ const construirHtmlReporteCierreCaja = ({
         <section class="header">
           <div class="header-row">
             <div class="brand-block">
-              ${logoBase64
-      ? `<div class="logo-wrap"><img src="${escapeHtml(logoBase64)}" alt="Farmacia Shaddai" /></div>`
-      : '<div class="logo-fallback">FS</div>'}
-              <div>
-                <div class="brand">Farmacia Shaddai</div>
-                <h1>Reporte de cierre de caja</h1>
-                <p class="subtitle">Corte generado al finalizar la sesión de caja.</p>
-              </div>
+              <div class="brand">Moda &amp; Belleza</div>
+              <h1>Reporte de cierre de caja</h1>
+              <p class="subtitle">Resumen de ventas, productos y movimientos de la sesión.</p>
             </div>
             <div style="text-align:right; flex:0 0 auto;">
               <div class="badge">Sesión #${escapeHtml(sesion.id_sesion || '—')}</div>
@@ -647,8 +660,7 @@ const construirHtmlReporteCierreCaja = ({
             <div class="metric"><div class="label">Monto inicial</div><div class="value">${escapeHtml(formatoMonedaMXN(resumen.monto_inicial))}</div></div>
             <div class="metric"><div class="label">Ventas efectivo</div><div class="value">${escapeHtml(formatoMonedaMXN(resumen.ventas_efectivo))}</div></div>
            <div class="metric"><div class="label">Ventas no efectivo</div><div class="value">${escapeHtml(formatoMonedaMXN(resumen.ventas_no_efectivo))}</div></div>
-<div class="metric"><div class="label">Servicios clínicos</div><div class="value">${escapeHtml(formatoMonedaMXN(totalServiciosClinicos))}</div></div>
-<div class="metric"><div class="label">Ventas puntos</div><div class="value">${escapeHtml(formatoMonedaMXN(ventasPuntos))}</div></div>
+            <div class="metric"><div class="label">Ventas puntos</div><div class="value">${escapeHtml(formatoMonedaMXN(ventasPuntos))}</div></div>
             <div class="metric"><div class="label">Puntos cajero</div><div class="value">${escapeHtml(puntosGanados.toFixed(2))}</div></div>
             <div class="metric"><div class="label">Total vendido</div><div class="value">${escapeHtml(formatoMonedaMXN(resumen.ventas_total))}</div></div>
           </div>
@@ -673,7 +685,7 @@ const construirHtmlReporteCierreCaja = ({
         </section>
 
         <section>
-          <h2>Productos vendidos</h2>
+          <h2>Resumen de productos vendidos</h2>
           <table>
             <thead><tr><th>Producto</th><th class="right">Cantidad</th><th class="right">Total vendido</th></tr></thead>
             <tbody>${filasProductos}</tbody>
@@ -681,24 +693,22 @@ const construirHtmlReporteCierreCaja = ({
         </section>
 
         <section>
-  <h2>Servicios clínicos cobrados</h2>
-  <table>
-    <thead>
-      <tr>
-        <th>Folio venta</th>
-        <th>Folio servicio</th>
-        <th>Paciente</th>
-        <th>Servicio</th>
-        <th class="right">Cantidad</th>
-        <th class="right">Precio</th>
-        <th class="right">Subtotal</th>
-        <th>Doctor</th>
-      </tr>
-    </thead>
-    <tbody>${filasServicios}</tbody>
-  </table>
-</section>
-
+          <h2>Detalle de productos vendidos</h2>
+          <table>
+            <thead>
+              <tr>
+                <th>Folio</th>
+                <th>Producto / variante</th>
+                <th>Código / SKU</th>
+                <th>Lote</th>
+                <th class="right">Cant.</th>
+                <th class="right">P. unitario</th>
+                <th class="right">Subtotal</th>
+              </tr>
+            </thead>
+            <tbody>${filasDetalleProductos}</tbody>
+          </table>
+        </section>
         <section>
           <h2>Movimientos de caja</h2>
           <table>
@@ -710,7 +720,6 @@ const construirHtmlReporteCierreCaja = ({
         <section class="total-box">
           <h2 style="margin-top:0">Resultado final del corte</h2>
           <div class="total-row"><span>Total vendido</span><strong>${escapeHtml(formatoMonedaMXN(resumen.ventas_total))}</strong></div>
-         <div class="total-row"><span>Servicios clínicos</span><strong>${escapeHtml(formatoMonedaMXN(totalServiciosClinicos))}</strong></div>
           <div class="total-row"><span>Total no efectivo</span><strong>${escapeHtml(formatoMonedaMXN(resumen.ventas_no_efectivo))}</strong></div>
           <div class="total-row"><span>Ventas con puntos</span><strong>${escapeHtml(formatoMonedaMXN(ventasPuntos))}</strong></div>
           <div class="total-row"><span>Puntos cajero</span><strong>${escapeHtml(puntosGanados.toFixed(2))}</strong></div>
@@ -740,10 +749,8 @@ const generarReporteCierreCajaPDF = async ({ idSesion, idUsuario }) => {
   const nombreArchivo = `cierre-caja-${idSesion}-${Date.now()}.pdf`;
   const rutaAbsoluta = path.join(REPORTES_CAJA_DIR, nombreArchivo);
   const rutaRelativa = `/uploads/reportes-caja/${nombreArchivo}`;
-  const logoBase64 = await obtenerLogoReporteBase64();
   const html = construirHtmlReporteCierreCaja({
     ...datosReporte,
-    logoBase64,
   });
 
   const browser = await puppeteer.launch({

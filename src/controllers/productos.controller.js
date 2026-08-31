@@ -38,6 +38,98 @@ const normalizarId = (valor) => {
     : null;
 };
 
+
+const configuracionVariantesDefault = {
+  talla: false,
+  color: false,
+  tono: false,
+  genero: false,
+  presentacion: false,
+  material: false,
+  modelo: false,
+  aroma: false,
+  capacidad: false,
+  personalizados: [],
+};
+
+const clavesVariantesPermitidas = [
+  'talla',
+  'color',
+  'tono',
+  'genero',
+  'presentacion',
+  'material',
+  'modelo',
+  'aroma',
+  'capacidad',
+];
+
+const crearClaveAtributo = (texto) => {
+  return String(texto || '')
+    .trim()
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-z0-9]+/g, '_')
+    .replace(/^_+|_+$/g, '')
+    .slice(0, 40);
+};
+
+const normalizarConfiguracionVariantes = (valor, usaVariantes = false) => {
+  if (!usaVariantes) {
+    return { ...configuracionVariantesDefault };
+  }
+
+  let origen = valor;
+
+  if (typeof origen === 'string') {
+    try {
+      origen = JSON.parse(origen);
+    } catch {
+      origen = {};
+    }
+  }
+
+  if (!origen || typeof origen !== 'object' || Array.isArray(origen)) {
+    origen = {};
+  }
+
+  const configuracion = { ...configuracionVariantesDefault };
+
+  for (const clave of clavesVariantesPermitidas) {
+    configuracion[clave] = normalizarBooleano(origen[clave], false);
+  }
+
+  const personalizadosEntrada = Array.isArray(origen.personalizados)
+    ? origen.personalizados
+    : [];
+
+  const vistos = new Set();
+  configuracion.personalizados = personalizadosEntrada
+    .map((item) => {
+      const etiqueta = String(item?.etiqueta || '').trim().slice(0, 80);
+      const clave = crearClaveAtributo(item?.clave || etiqueta);
+      return { clave, etiqueta };
+    })
+    .filter((item) => {
+      if (!item.clave || !item.etiqueta) return false;
+      if (clavesVariantesPermitidas.includes(item.clave)) return false;
+      if (vistos.has(item.clave)) return false;
+      vistos.add(item.clave);
+      return true;
+    });
+
+  return configuracion;
+};
+
+const tieneConfiguracionVariantes = (configuracion) => {
+  return (
+    clavesVariantesPermitidas.some((clave) => Boolean(configuracion?.[clave])) ||
+    (Array.isArray(configuracion?.personalizados) &&
+      configuracion.personalizados.length > 0)
+  );
+};
+
 export const listarProductos = async (req, res) => {
   try {
     const {
@@ -88,6 +180,7 @@ export const listarProductos = async (req, res) => {
         p.precio_compra,
         p.precio_venta,
         p.usa_variantes,
+        p.configuracion_variantes,
         p.controla_lotes,
         p.controla_caducidad,
         p.activo,
@@ -231,6 +324,7 @@ export const obtenerProducto = async (
           p.precio_compra,
           p.precio_venta,
           p.usa_variantes,
+          p.configuracion_variantes,
           p.controla_lotes,
           p.controla_caducidad,
           p.activo,
@@ -288,6 +382,7 @@ export const crearProducto = async (
       precio_compra,
       precio_venta,
       usa_variantes,
+      configuracion_variantes,
       controla_lotes,
       controla_caducidad,
       activo = true,
@@ -344,6 +439,23 @@ export const crearProducto = async (
         usa_variantes,
         false
       );
+
+    const configuracionVariantesNormalizada =
+      normalizarConfiguracionVariantes(
+        configuracion_variantes,
+        usaVariantesNormalizado
+      );
+
+    if (
+      usaVariantesNormalizado &&
+      !tieneConfiguracionVariantes(configuracionVariantesNormalizada)
+    ) {
+      return res.status(400).json({
+        ok: false,
+        mensaje:
+          'Selecciona al menos un tipo de variante para el producto',
+      });
+    }
 
     let controlaLotesNormalizado =
       normalizarBooleano(
@@ -453,6 +565,7 @@ export const crearProducto = async (
           precio_compra,
           precio_venta,
           usa_variantes,
+          configuracion_variantes,
           controla_lotes,
           controla_caducidad,
           activo
@@ -467,9 +580,10 @@ export const crearProducto = async (
           $7,
           $8,
           $9,
-          $10,
+          $10::jsonb,
           $11,
-          $12
+          $12,
+          $13
         )
         RETURNING *
       `,
@@ -489,6 +603,7 @@ export const crearProducto = async (
         Number(precio_compra || 0),
         Number(precio_venta),
         usaVariantesNormalizado,
+        JSON.stringify(configuracionVariantesNormalizada),
         controlaLotesNormalizado,
         controlaCaducidadNormalizado,
         activoNormalizado,
@@ -562,6 +677,7 @@ export const actualizarProducto = async (
       precio_compra,
       precio_venta,
       usa_variantes,
+      configuracion_variantes,
       controla_lotes,
       controla_caducidad,
       activo,
@@ -618,6 +734,23 @@ export const actualizarProducto = async (
         usa_variantes,
         false
       );
+
+    const configuracionVariantesNormalizada =
+      normalizarConfiguracionVariantes(
+        configuracion_variantes,
+        usaVariantesNormalizado
+      );
+
+    if (
+      usaVariantesNormalizado &&
+      !tieneConfiguracionVariantes(configuracionVariantesNormalizada)
+    ) {
+      return res.status(400).json({
+        ok: false,
+        mensaje:
+          'Selecciona al menos un tipo de variante para el producto',
+      });
+    }
 
     let controlaLotesNormalizado =
       normalizarBooleano(
@@ -752,10 +885,11 @@ export const actualizarProducto = async (
             precio_compra = $7,
             precio_venta = $8,
             usa_variantes = $9,
-            controla_lotes = $10,
-            controla_caducidad = $11,
-            activo = COALESCE($12, activo)
-          WHERE id_producto = $13
+            configuracion_variantes = $10::jsonb,
+            controla_lotes = $11,
+            controla_caducidad = $12,
+            activo = COALESCE($13, activo)
+          WHERE id_producto = $14
           RETURNING *
         `,
         [
@@ -780,6 +914,7 @@ export const actualizarProducto = async (
           ),
           Number(precio_venta),
           usaVariantesNormalizado,
+          JSON.stringify(configuracionVariantesNormalizada),
           controlaLotesNormalizado,
           controlaCaducidadNormalizado,
           activo === undefined
