@@ -239,13 +239,15 @@ const descontarLotesFEFO = async ({
   id_sucursal,
   id_producto,
   id_variante = null,
+  usaVariantes = false,
   cantidadVenta,
 }) => {
   let cantidadPendiente = Number(cantidadVenta);
 
-  const lotesResultado = await client.query(
-    `
-    SELECT 
+  const params = [id_sucursal, id_producto];
+
+  let query = `
+    SELECT
       id_lote,
       id_variante,
       lote,
@@ -254,17 +256,28 @@ const descontarLotesFEFO = async ({
     FROM inventario_lotes
     WHERE id_sucursal = $1
       AND id_producto = $2
-      AND id_variante IS NOT DISTINCT FROM $3::integer
       AND activo = true
       AND stock_actual > 0
+  `;
+
+  // Si el producto realmente usa variantes, el lote sí debe pertenecer a la
+  // variante seleccionada. Para productos sin variantes no filtramos por
+  // id_variante, porque hay inventario histórico migrado con una variante
+  // principal aunque el producto actualmente no utilice variantes.
+  if (usaVariantes) {
+    params.push(id_variante);
+    query += ` AND id_variante IS NOT DISTINCT FROM $${params.length}::integer `;
+  }
+
+  query += `
     ORDER BY
       fecha_caducidad ASC NULLS LAST,
       fecha_entrada ASC,
       id_lote ASC
     FOR UPDATE
-    `,
-    [id_sucursal, id_producto, id_variante]
-  );
+  `;
+
+  const lotesResultado = await client.query(query, params);
 
   const stockTotalLotes = lotesResultado.rows.reduce((acc, lote) => {
     return acc + Number(lote.stock_actual || 0);
@@ -325,13 +338,15 @@ const descontarLoteSeleccionado = async ({
   id_sucursal,
   id_producto,
   id_variante = null,
+  usaVariantes = false,
   id_lote,
   cantidadVenta,
 }) => {
   const cantidadADescontar = Number(cantidadVenta);
 
-  const loteResultado = await client.query(
-    `
+  const params = [id_lote, id_sucursal, id_producto];
+
+  let query = `
     SELECT
       id_lote,
       id_sucursal,
@@ -345,11 +360,20 @@ const descontarLoteSeleccionado = async ({
     WHERE id_lote = $1
       AND id_sucursal = $2
       AND id_producto = $3
-      AND id_variante IS NOT DISTINCT FROM $4::integer
-    FOR UPDATE
-    `,
-    [id_lote, id_sucursal, id_producto, id_variante]
-  );
+  `;
+
+  // Para productos con variantes mantenemos la validación estricta.
+  // Para productos sin variantes basta validar que el lote corresponda al
+  // producto y a la sucursal; esto permite vender lotes históricos que
+  // conservaron id_variante después de la migración.
+  if (usaVariantes) {
+    params.push(id_variante);
+    query += ` AND id_variante IS NOT DISTINCT FROM $${params.length}::integer `;
+  }
+
+  query += ` FOR UPDATE `;
+
+  const loteResultado = await client.query(query, params);
 
   if (loteResultado.rows.length === 0) {
     return {
@@ -931,22 +955,36 @@ export const crearVenta = async (req, res) => {
         });
       }
 
-      const resultadoLotes = idLoteSeleccionado
-        ? await descontarLoteSeleccionado({
-          client,
-          id_sucursal,
-          id_producto,
-          id_variante: idVarianteSeleccionada,
-          id_lote: idLoteSeleccionado,
-          cantidadVenta,
-        })
-        : await descontarLotesFEFO({
-          client,
-          id_sucursal,
-          id_producto,
-          id_variante: idVarianteSeleccionada,
-          cantidadVenta,
-        });
+      const controlaLotes = esValorActivo(producto.controla_lotes);
+
+      // Un producto que no controla lotes no debe intentar descontar de
+      // inventario_lotes. Para productos con control de lotes se respeta el
+      // lote elegido; si no se eligió uno explícitamente, se usa FEFO.
+      let resultadoLotes = {
+        ok: true,
+        lotes_descontados: [],
+      };
+
+      if (controlaLotes) {
+        resultadoLotes = idLoteSeleccionado
+          ? await descontarLoteSeleccionado({
+            client,
+            id_sucursal,
+            id_producto,
+            id_variante: idVarianteSeleccionada,
+            usaVariantes,
+            id_lote: idLoteSeleccionado,
+            cantidadVenta,
+          })
+          : await descontarLotesFEFO({
+            client,
+            id_sucursal,
+            id_producto,
+            id_variante: idVarianteSeleccionada,
+            usaVariantes,
+            cantidadVenta,
+          });
+      }
 
       if (!resultadoLotes.ok) {
         await client.query('ROLLBACK');
@@ -1730,23 +1768,78 @@ export const obtenerInfoDevolucionVenta = async (req, res) => {
       return responderAccesoCajaDenegado(res, accesoCaja);
     }
 
+    /*
+     * Compatibilidad con ventas históricas:
+     * algunas ventas/lotes antiguos recibieron id_variante durante la migración
+     * aunque el producto actualmente NO usa variantes. Para la devolución
+     * exponemos la variante únicamente cuando productos.usa_variantes = true.
+     */
     const detalleResultado = await pool.query(
       `
       SELECT
         vd.id_detalle,
         vd.id_venta,
         vd.id_producto,
-        vd.id_variante,
+
+        CASE
+          WHEN COALESCE(p.usa_variantes, false) = true
+            THEN vd.id_variante
+          ELSE NULL
+        END AS id_variante,
+
+        p.usa_variantes,
+        p.controla_lotes,
         p.nombre AS producto,
         p.codigo_barras,
-        pv.nombre_variante,
-        pv.sku AS sku_variante,
-        pv.codigo_barras AS codigo_barras_variante,
-        pv.talla,
-        pv.color,
-        pv.tono,
-        pv.presentacion AS presentacion_variante,
-        COALESCE(pv.atributos, '{}'::jsonb) AS atributos_variante,
+
+        CASE
+          WHEN COALESCE(p.usa_variantes, false) = true
+            THEN pv.nombre_variante
+          ELSE NULL
+        END AS nombre_variante,
+
+        CASE
+          WHEN COALESCE(p.usa_variantes, false) = true
+            THEN pv.sku
+          ELSE NULL
+        END AS sku_variante,
+
+        CASE
+          WHEN COALESCE(p.usa_variantes, false) = true
+            THEN pv.codigo_barras
+          ELSE NULL
+        END AS codigo_barras_variante,
+
+        CASE
+          WHEN COALESCE(p.usa_variantes, false) = true
+            THEN pv.talla
+          ELSE NULL
+        END AS talla,
+
+        CASE
+          WHEN COALESCE(p.usa_variantes, false) = true
+            THEN pv.color
+          ELSE NULL
+        END AS color,
+
+        CASE
+          WHEN COALESCE(p.usa_variantes, false) = true
+            THEN pv.tono
+          ELSE NULL
+        END AS tono,
+
+        CASE
+          WHEN COALESCE(p.usa_variantes, false) = true
+            THEN pv.presentacion
+          ELSE NULL
+        END AS presentacion_variante,
+
+        CASE
+          WHEN COALESCE(p.usa_variantes, false) = true
+            THEN COALESCE(pv.atributos, '{}'::jsonb)
+          ELSE '{}'::jsonb
+        END AS atributos_variante,
+
         vd.id_lote,
         il.lote,
         il.fecha_caducidad,
@@ -1754,21 +1847,40 @@ export const obtenerInfoDevolucionVenta = async (req, res) => {
         vd.precio_unitario,
         vd.descuento,
         vd.subtotal,
-        COALESCE(dev.cantidad_devuelta, 0)::numeric(12,2) AS cantidad_devuelta,
+
+        COALESCE(
+          dev.cantidad_devuelta,
+          0
+        )::numeric(12,2) AS cantidad_devuelta,
+
         (
-          COALESCE(vd.cantidad, 0) - COALESCE(dev.cantidad_devuelta, 0)
+          COALESCE(vd.cantidad, 0) -
+          COALESCE(dev.cantidad_devuelta, 0)
         )::numeric(12,2) AS cantidad_disponible_devolver
+
       FROM venta_detalle vd
-      INNER JOIN productos p ON p.id_producto = vd.id_producto
-      LEFT JOIN producto_variantes pv ON pv.id_variante = vd.id_variante
-      LEFT JOIN inventario_lotes il ON il.id_lote = vd.id_lote
+      INNER JOIN productos p
+        ON p.id_producto = vd.id_producto
+
+      LEFT JOIN producto_variantes pv
+        ON pv.id_variante = vd.id_variante
+       AND COALESCE(p.usa_variantes, false) = true
+
+      LEFT JOIN inventario_lotes il
+        ON il.id_lote = vd.id_lote
+
       LEFT JOIN (
         SELECT
           id_detalle,
-          COALESCE(SUM(cantidad_devuelta), 0)::numeric(12,2) AS cantidad_devuelta
+          COALESCE(
+            SUM(cantidad_devuelta),
+            0
+          )::numeric(12,2) AS cantidad_devuelta
         FROM ventas_devoluciones_detalle
         GROUP BY id_detalle
-      ) dev ON dev.id_detalle = vd.id_detalle
+      ) dev
+        ON dev.id_detalle = vd.id_detalle
+
       WHERE vd.id_venta = $1
       ORDER BY vd.id_detalle ASC
       `,
@@ -1777,7 +1889,11 @@ export const obtenerInfoDevolucionVenta = async (req, res) => {
 
     const montoDevueltoResultado = await pool.query(
       `
-      SELECT COALESCE(SUM(monto_devuelto), 0)::numeric(12,2) AS monto_devuelto
+      SELECT
+        COALESCE(
+          SUM(monto_devuelto),
+          0
+        )::numeric(12,2) AS monto_devuelto
       FROM ventas_devoluciones
       WHERE id_venta = $1
         AND estado = 'APLICADA'
@@ -1789,16 +1905,22 @@ export const obtenerInfoDevolucionVenta = async (req, res) => {
       ok: true,
       venta: {
         ...venta,
-        monto_devuelto: Number(montoDevueltoResultado.rows[0]?.monto_devuelto || 0),
+        monto_devuelto: Number(
+          montoDevueltoResultado.rows[0]?.monto_devuelto || 0
+        ),
       },
       productos: detalleResultado.rows,
     });
   } catch (error) {
-    console.error('Error al obtener información de devolución:', error);
+    console.error(
+      'Error al obtener información de devolución:',
+      error
+    );
 
     return res.status(500).json({
       ok: false,
-      mensaje: 'Error interno al obtener información de devolución',
+      mensaje:
+        'Error interno al obtener información de devolución',
     });
   }
 };
@@ -2127,19 +2249,25 @@ export const devolverVenta = async (req, res) => {
 
   try {
     const { id } = req.params;
-    const { productos, motivo, observaciones } = req.body;
+    const {
+      productos,
+      motivo,
+      observaciones,
+    } = req.body;
 
     if (!Array.isArray(productos) || productos.length === 0) {
       return res.status(400).json({
         ok: false,
-        mensaje: 'Debes enviar al menos un producto para devolver',
+        mensaje:
+          'Debes enviar al menos un producto para devolver',
       });
     }
 
     if (!motivo || !String(motivo).trim()) {
       return res.status(400).json({
         ok: false,
-        mensaje: 'El motivo de la devolución es obligatorio',
+        mensaje:
+          'El motivo de la devolución es obligatorio',
       });
     }
 
@@ -2147,22 +2275,22 @@ export const devolverVenta = async (req, res) => {
 
     const ventaResultado = await client.query(
       `
-  SELECT
-    id_venta,
-    folio,
-    id_sucursal,
-    id_caja,
-    id_sesion,
-    subtotal,
-    descuento,
-    impuesto,
-    total,
-    metodo_pago,
-    estado
-  FROM ventas
-  WHERE id_venta = $1
-  FOR UPDATE
-  `,
+      SELECT
+        id_venta,
+        folio,
+        id_sucursal,
+        id_caja,
+        id_sesion,
+        subtotal,
+        descuento,
+        impuesto,
+        total,
+        metodo_pago,
+        estado
+      FROM ventas
+      WHERE id_venta = $1
+      FOR UPDATE
+      `,
       [id]
     );
 
@@ -2187,23 +2315,35 @@ export const devolverVenta = async (req, res) => {
 
     if (!accesoCaja.ok) {
       await client.query('ROLLBACK');
-      return responderAccesoCajaDenegado(res, accesoCaja);
+      return responderAccesoCajaDenegado(
+        res,
+        accesoCaja
+      );
     }
 
-    const estadoVenta = String(venta.estado || '').toUpperCase();
+    const estadoVenta = String(
+      venta.estado || ''
+    ).toUpperCase();
 
-    if (!estadosVentaConDevolucionPermitida.includes(estadoVenta)) {
+    if (
+      !estadosVentaConDevolucionPermitida.includes(
+        estadoVenta
+      )
+    ) {
       await client.query('ROLLBACK');
 
       return res.status(400).json({
         ok: false,
-        mensaje: `No se puede devolver una venta con estado ${estadoVenta}`,
+        mensaje:
+          `No se puede devolver una venta con estado ${estadoVenta}`,
       });
     }
 
     const sesionResultado = await client.query(
       `
-      SELECT id_sesion, estado
+      SELECT
+        id_sesion,
+        estado
       FROM caja_sesiones
       WHERE id_sesion = $1
       `,
@@ -2215,11 +2355,14 @@ export const devolverVenta = async (req, res) => {
 
       return res.status(404).json({
         ok: false,
-        mensaje: 'No se encontró la sesión de caja de la venta',
+        mensaje:
+          'No se encontró la sesión de caja de la venta',
       });
     }
 
-    if (sesionResultado.rows[0].estado !== 'ABIERTA') {
+    if (
+      sesionResultado.rows[0].estado !== 'ABIERTA'
+    ) {
       await client.query('ROLLBACK');
 
       return res.status(400).json({
@@ -2232,16 +2375,30 @@ export const devolverVenta = async (req, res) => {
     let montoDevueltoTotal = 0;
     const detallesDevueltos = [];
 
+    /*
+     * Primero validamos todos los renglones solicitados.
+     *
+     * Importante:
+     * venta_detalle.id_variante puede contener una variante histórica
+     * generada por una migración, aun cuando el producto actualmente
+     * NO use variantes. La fuente de verdad es productos.usa_variantes.
+     */
     for (const item of productos) {
       const idDetalle = Number(item.id_detalle);
-      const cantidadSolicitada = Number(item.cantidad || 0);
+      const cantidadSolicitada = Number(
+        item.cantidad || 0
+      );
 
-      if (!idDetalle || cantidadSolicitada <= 0) {
+      if (
+        !idDetalle ||
+        cantidadSolicitada <= 0
+      ) {
         await client.query('ROLLBACK');
 
         return res.status(400).json({
           ok: false,
-          mensaje: 'Cada producto debe incluir id_detalle y cantidad mayor a cero',
+          mensaje:
+            'Cada producto debe incluir id_detalle y cantidad mayor a cero',
         });
       }
 
@@ -2251,247 +2408,270 @@ export const devolverVenta = async (req, res) => {
           vd.id_detalle,
           vd.id_venta,
           vd.id_producto,
-          vd.id_variante,
+
+          vd.id_variante AS id_variante_historica,
+
+          CASE
+            WHEN COALESCE(p.usa_variantes, false) = true
+              THEN vd.id_variante
+            ELSE NULL
+          END AS id_variante,
+
+          p.usa_variantes,
+          p.controla_lotes,
+          vd.id_lote,
+
           p.nombre AS producto,
-          pv.nombre_variante,
+
+          CASE
+            WHEN COALESCE(p.usa_variantes, false) = true
+              THEN pv.nombre_variante
+            ELSE NULL
+          END AS nombre_variante,
+
           vd.cantidad,
           vd.precio_unitario,
           vd.subtotal
+
         FROM venta_detalle vd
-        INNER JOIN productos p ON p.id_producto = vd.id_producto
-        LEFT JOIN producto_variantes pv ON pv.id_variante = vd.id_variante
+
+        INNER JOIN productos p
+          ON p.id_producto = vd.id_producto
+
+        LEFT JOIN producto_variantes pv
+          ON pv.id_variante = vd.id_variante
+         AND COALESCE(p.usa_variantes, false) = true
+
         WHERE vd.id_detalle = $1
           AND vd.id_venta = $2
+
         FOR UPDATE OF vd
         `,
-        [idDetalle, venta.id_venta]
+        [
+          idDetalle,
+          venta.id_venta,
+        ]
       );
 
-      if (detalleResultado.rows.length === 0) {
+      if (
+        detalleResultado.rows.length === 0
+      ) {
         await client.query('ROLLBACK');
 
         return res.status(404).json({
           ok: false,
-          mensaje: `No se encontró el detalle de venta ${idDetalle}`,
+          mensaje:
+            `No se encontró el detalle de venta ${idDetalle}`,
         });
       }
 
-      const detalle = detalleResultado.rows[0];
+      const detalle =
+        detalleResultado.rows[0];
 
-      const devueltoResultado = await client.query(
-        `
-        SELECT COALESCE(SUM(cantidad_devuelta), 0)::numeric(12,2) AS cantidad_devuelta
-        FROM ventas_devoluciones_detalle
-        WHERE id_detalle = $1
-        `,
-        [idDetalle]
+      const usaVariantes = esValorActivo(
+        detalle.usa_variantes
       );
 
-      const cantidadVendida = Number(detalle.cantidad || 0);
+      const controlaLotes = esValorActivo(
+        detalle.controla_lotes
+      );
+
+      const idVarianteEfectiva =
+        usaVariantes &&
+        Number(detalle.id_variante || 0) > 0
+          ? Number(detalle.id_variante)
+          : null;
+
+      const devueltoResultado =
+        await client.query(
+          `
+          SELECT
+            COALESCE(
+              SUM(cantidad_devuelta),
+              0
+            )::numeric(12,2) AS cantidad_devuelta
+          FROM ventas_devoluciones_detalle
+          WHERE id_detalle = $1
+          `,
+          [idDetalle]
+        );
+
+      const cantidadVendida = Number(
+        detalle.cantidad || 0
+      );
+
       const cantidadYaDevuelta = Number(
-        devueltoResultado.rows[0]?.cantidad_devuelta || 0
+        devueltoResultado.rows[0]
+          ?.cantidad_devuelta || 0
       );
-      const cantidadDisponible = cantidadVendida - cantidadYaDevuelta;
 
-      if (cantidadSolicitada > cantidadDisponible) {
+      const cantidadDisponible =
+        cantidadVendida -
+        cantidadYaDevuelta;
+
+      if (
+        cantidadSolicitada >
+        cantidadDisponible
+      ) {
         await client.query('ROLLBACK');
 
         return res.status(400).json({
           ok: false,
-          mensaje: `No puedes devolver ${cantidadSolicitada} de ${detalle.producto}. Disponible para devolver: ${cantidadDisponible}`,
+          mensaje:
+            `No puedes devolver ${cantidadSolicitada} de ${detalle.producto}. Disponible para devolver: ${cantidadDisponible}`,
         });
       }
 
-      const subtotalDetalle = Number(detalle.subtotal || 0);
-      const totalVenta = Number(venta.total || 0);
-      const subtotalVenta = Number(venta.subtotal || 0);
+      const subtotalDetalle = Number(
+        detalle.subtotal || 0
+      );
+
+      const totalVenta = Number(
+        venta.total || 0
+      );
+
+      const subtotalVenta = Number(
+        venta.subtotal || 0
+      );
 
       const factorTotalVenta =
         subtotalVenta > 0
           ? totalVenta / subtotalVenta
           : 1;
 
-      const precioProporcionalSubtotal = redondearDos(
-        subtotalDetalle / cantidadVendida
-      );
+      const precioProporcionalSubtotal =
+        redondearDos(
+          subtotalDetalle /
+          cantidadVendida
+        );
 
-      const subtotalDevuelto = redondearDos(
-        precioProporcionalSubtotal * cantidadSolicitada
-      );
+      const subtotalDevuelto =
+        redondearDos(
+          precioProporcionalSubtotal *
+          cantidadSolicitada
+        );
 
-      const totalDevueltoConImpuesto = redondearDos(
-        subtotalDevuelto * factorTotalVenta
-      );
+      const totalDevueltoConImpuesto =
+        redondearDos(
+          subtotalDevuelto *
+          factorTotalVenta
+        );
 
-      montoDevueltoTotal += totalDevueltoConImpuesto;
+      montoDevueltoTotal +=
+        totalDevueltoConImpuesto;
 
       detallesDevueltos.push({
-        id_detalle: detalle.id_detalle,
-        id_producto: detalle.id_producto,
-        id_variante: detalle.id_variante || null,
-        producto: detalle.nombre_variante
-          ? `${detalle.producto} · ${detalle.nombre_variante}`
-          : detalle.producto,
-        cantidad_devuelta: cantidadSolicitada,
-        precio_unitario: precioProporcionalSubtotal,
-        subtotal_devuelto: subtotalDevuelto,
+        id_detalle:
+          detalle.id_detalle,
+
+        id_producto:
+          detalle.id_producto,
+
+        id_variante:
+          idVarianteEfectiva,
+
+        usa_variantes:
+          usaVariantes,
+
+        controla_lotes:
+          controlaLotes,
+
+        id_lote:
+          detalle.id_lote
+            ? Number(detalle.id_lote)
+            : null,
+
+        producto:
+          usaVariantes &&
+          detalle.nombre_variante
+            ? `${detalle.producto} · ${detalle.nombre_variante}`
+            : detalle.producto,
+
+        cantidad_devuelta:
+          cantidadSolicitada,
+
+        precio_unitario:
+          precioProporcionalSubtotal,
+
+        subtotal_devuelto:
+          subtotalDevuelto,
       });
     }
 
-    montoDevueltoTotal = redondearDos(montoDevueltoTotal);
+    montoDevueltoTotal =
+      redondearDos(
+        montoDevueltoTotal
+      );
 
     if (montoDevueltoTotal <= 0) {
       await client.query('ROLLBACK');
 
       return res.status(400).json({
         ok: false,
-        mensaje: 'El monto de la devolución debe ser mayor a cero',
+        mensaje:
+          'El monto de la devolución debe ser mayor a cero',
       });
     }
 
-    const folioDevolucion = generarFolioDevolucion();
+    const folioDevolucion =
+      generarFolioDevolucion();
 
-    const devolucionResultado = await client.query(
-      `
-      INSERT INTO ventas_devoluciones (
-        id_venta,
-        id_sesion,
-        id_sucursal,
-        id_usuario,
-        folio_devolucion,
-        metodo_pago_original,
-        monto_devuelto,
-        motivo,
-        observaciones,
-        estado
-      )
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'APLICADA')
-      RETURNING *
-      `,
-      [
-        venta.id_venta,
-        venta.id_sesion,
-        venta.id_sucursal,
-        req.usuario.id_usuario,
-        folioDevolucion,
-        venta.metodo_pago,
-        montoDevueltoTotal,
-        motivo.trim(),
-        observaciones ? observaciones.trim() : null,
-      ]
-    );
-
-    const devolucion = devolucionResultado.rows[0];
-
-    for (const detalle of detallesDevueltos) {
-      let cantidadPendienteRestituir = Number(detalle.cantidad_devuelta);
-
-      const lotesVentaResultado = await client.query(
+    const devolucionResultado =
+      await client.query(
         `
-        SELECT
-          im.id_lote,
-          im.id_variante,
-          il.lote,
-          im.cantidad,
-          im.stock_nuevo
-        FROM inventario_movimientos im
-        LEFT JOIN inventario_lotes il ON il.id_lote = im.id_lote
-        WHERE im.referencia = $1
-          AND im.tipo_movimiento = 'VENTA'
-          AND im.id_producto = $2
-          AND im.id_variante IS NOT DISTINCT FROM $3::integer
-        ORDER BY im.fecha_movimiento ASC, im.id_movimiento ASC
+        INSERT INTO ventas_devoluciones (
+          id_venta,
+          id_sesion,
+          id_sucursal,
+          id_usuario,
+          folio_devolucion,
+          metodo_pago_original,
+          monto_devuelto,
+          motivo,
+          observaciones,
+          estado
+        )
+        VALUES (
+          $1,$2,$3,$4,$5,$6,$7,$8,$9,
+          'APLICADA'
+        )
+        RETURNING *
         `,
-        [venta.folio, detalle.id_producto, detalle.id_variante]
+        [
+          venta.id_venta,
+          venta.id_sesion,
+          venta.id_sucursal,
+          req.usuario.id_usuario,
+          folioDevolucion,
+          venta.metodo_pago,
+          montoDevueltoTotal,
+          motivo.trim(),
+          observaciones
+            ? observaciones.trim()
+            : null,
+        ]
       );
 
-      if (lotesVentaResultado.rows.length === 0) {
-        await client.query('ROLLBACK');
+    const devolucion =
+      devolucionResultado.rows[0];
 
-        return res.status(400).json({
-          ok: false,
-          mensaje: `No se encontraron movimientos de inventario de venta para ${detalle.producto}`,
-        });
-      }
-
-      for (const loteVenta of lotesVentaResultado.rows) {
-        if (cantidadPendienteRestituir <= 0) break;
-
-        const devueltoPorLoteResultado = await client.query(
-          `
-          SELECT COALESCE(SUM(cantidad_devuelta), 0)::numeric(12,2) AS cantidad_devuelta
-          FROM ventas_devoluciones_detalle
-          WHERE id_venta = $1
-            AND id_producto = $2
-            AND id_variante IS NOT DISTINCT FROM $3::integer
-            AND id_lote IS NOT DISTINCT FROM $4
-          `,
-          [
-            venta.id_venta,
-            detalle.id_producto,
-            detalle.id_variante,
-            loteVenta.id_lote,
-          ]
-        );
-
-        const cantidadLoteVendida = Number(loteVenta.cantidad || 0);
-        const cantidadLoteYaDevuelta = Number(
-          devueltoPorLoteResultado.rows[0]?.cantidad_devuelta || 0
-        );
-        const cantidadLoteDisponible =
-          cantidadLoteVendida - cantidadLoteYaDevuelta;
-
-        if (cantidadLoteDisponible <= 0) continue;
-
-        const cantidadARestituir = Math.min(
-          cantidadPendienteRestituir,
-          cantidadLoteDisponible
-        );
-
-        const loteActualResultado = await client.query(
-          `
-          SELECT
-            id_lote,
-            id_variante,
-            stock_actual
-          FROM inventario_lotes
-          WHERE id_lote = $1
-            AND id_variante IS NOT DISTINCT FROM $2::integer
-          FOR UPDATE
-          `,
-          [loteVenta.id_lote, detalle.id_variante]
-        );
-
-        if (loteActualResultado.rows.length === 0) {
-          await client.query('ROLLBACK');
-
-          return res.status(404).json({
-            ok: false,
-            mensaje: `No se encontró el lote para restituir ${detalle.producto}`,
-          });
+    /*
+     * Helpers locales de devolución.
+     */
+    const restituirInventarioVariante =
+      async ({
+        detalle,
+        cantidad,
+      }) => {
+        if (
+          !detalle.usa_variantes ||
+          !detalle.id_variante
+        ) {
+          return;
         }
 
-        const stockLoteAnterior = Number(
-          loteActualResultado.rows[0].stock_actual || 0
-        );
-        const stockLoteNuevo = redondearDos(
-          stockLoteAnterior + cantidadARestituir
-        );
-
-        await client.query(
-          `
-          UPDATE inventario_lotes
-          SET
-            stock_actual = $1,
-            activo = true,
-            fecha_actualizacion = CURRENT_TIMESTAMP
-          WHERE id_lote = $2
-          `,
-          [stockLoteNuevo, loteVenta.id_lote]
-        );
-
-        if (detalle.id_variante) {
-          const inventarioVarianteResultado = await client.query(
+        const resultado =
+          await client.query(
             `
             SELECT
               id_inventario_variante,
@@ -2509,71 +2689,92 @@ export const devolverVenta = async (req, res) => {
             ]
           );
 
-          if (inventarioVarianteResultado.rows.length === 0) {
-            await client.query('ROLLBACK');
-
-            return res.status(404).json({
-              ok: false,
-              mensaje: `No se encontró el inventario de la variante para ${detalle.producto}`,
-            });
-          }
-
-          const stockVarianteAnterior = Number(
-            inventarioVarianteResultado.rows[0].stock_actual || 0
-          );
-
-          const stockVarianteNuevo = redondearDos(
-            stockVarianteAnterior + cantidadARestituir
-          );
-
-          await client.query(
-            `
-            UPDATE inventario_variantes_sucursal
-            SET
-              stock_actual = $1,
-              activo = true,
-              fecha_actualizacion = CURRENT_TIMESTAMP
-            WHERE id_sucursal = $2
-              AND id_producto = $3
-              AND id_variante = $4
-            `,
-            [
-              stockVarianteNuevo,
-              venta.id_sucursal,
-              detalle.id_producto,
-              detalle.id_variante,
-            ]
-          );
-        }
-
-        const inventarioResultado = await client.query(
-          `
-          SELECT
-            id_inventario,
-            stock_actual
-          FROM inventario_sucursal
-          WHERE id_sucursal = $1
-            AND id_producto = $2
-          FOR UPDATE
-          `,
-          [venta.id_sucursal, detalle.id_producto]
-        );
-
-        if (inventarioResultado.rows.length === 0) {
+        if (
+          resultado.rows.length === 0
+        ) {
           await client.query('ROLLBACK');
 
-          return res.status(404).json({
-            ok: false,
-            mensaje: `No se encontró inventario de sucursal para ${detalle.producto}`,
-          });
+          const error = new Error(
+            `No se encontró el inventario de la variante para ${detalle.producto}`
+          );
+
+          error.statusCode = 404;
+          throw error;
         }
 
-        const stockSucursalAnterior = Number(
-          inventarioResultado.rows[0].stock_actual || 0
+        const stockAnterior = Number(
+          resultado.rows[0]
+            .stock_actual || 0
         );
-        const stockSucursalNuevo = redondearDos(
-          stockSucursalAnterior + cantidadARestituir
+
+        const stockNuevo =
+          redondearDos(
+            stockAnterior +
+            Number(cantidad || 0)
+          );
+
+        await client.query(
+          `
+          UPDATE inventario_variantes_sucursal
+          SET
+            stock_actual = $1,
+            activo = true,
+            fecha_actualizacion = CURRENT_TIMESTAMP
+          WHERE id_inventario_variante = $2
+          `,
+          [
+            stockNuevo,
+            resultado.rows[0]
+              .id_inventario_variante,
+          ]
         );
+      };
+
+    const restituirInventarioSucursal =
+      async ({
+        detalle,
+        cantidad,
+      }) => {
+        const resultado =
+          await client.query(
+            `
+            SELECT
+              id_inventario,
+              stock_actual
+            FROM inventario_sucursal
+            WHERE id_sucursal = $1
+              AND id_producto = $2
+            FOR UPDATE
+            `,
+            [
+              venta.id_sucursal,
+              detalle.id_producto,
+            ]
+          );
+
+        if (
+          resultado.rows.length === 0
+        ) {
+          await client.query('ROLLBACK');
+
+          const error = new Error(
+            `No se encontró inventario de sucursal para ${detalle.producto}`
+          );
+
+          error.statusCode = 404;
+          throw error;
+        }
+
+        const stockAnterior = Number(
+          resultado.rows[0]
+            .stock_actual || 0
+        );
+
+        const stockNuevo =
+          redondearDos(
+            stockAnterior +
+            Number(cantidad || 0)
+          );
 
         await client.query(
           `
@@ -2581,15 +2782,36 @@ export const devolverVenta = async (req, res) => {
           SET
             stock_actual = $1,
             fecha_actualizacion = CURRENT_TIMESTAMP
-          WHERE id_sucursal = $2
-            AND id_producto = $3
+          WHERE id_inventario = $2
           `,
-          [stockSucursalNuevo, venta.id_sucursal, detalle.id_producto]
+          [
+            stockNuevo,
+            resultado.rows[0]
+              .id_inventario,
+          ]
         );
 
-        const subtotalParcial = redondearDos(
-          detalle.precio_unitario * cantidadARestituir
-        );
+        return {
+          stock_anterior:
+            stockAnterior,
+          stock_nuevo:
+            stockNuevo,
+        };
+      };
+
+    const registrarDetalleDevolucion =
+      async ({
+        detalle,
+        idLote = null,
+        cantidad,
+        stockSucursalAnterior,
+        stockSucursalNuevo,
+      }) => {
+        const subtotalParcial =
+          redondearDos(
+            detalle.precio_unitario *
+            Number(cantidad || 0)
+          );
 
         await client.query(
           `
@@ -2605,7 +2827,9 @@ export const devolverVenta = async (req, res) => {
             precio_unitario,
             subtotal_devuelto
           )
-          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+          VALUES (
+            $1,$2,$3,$4,$5,$6,$7,$8,$9,$10
+          )
           `,
           [
             devolucion.id_devolucion,
@@ -2613,9 +2837,9 @@ export const devolverVenta = async (req, res) => {
             detalle.id_detalle,
             detalle.id_producto,
             detalle.id_variante,
-            loteVenta.id_lote,
+            idLote,
             detalle.producto,
-            cantidadARestituir,
+            Number(cantidad || 0),
             detalle.precio_unitario,
             subtotalParcial,
           ]
@@ -2636,14 +2860,18 @@ export const devolverVenta = async (req, res) => {
             observaciones,
             id_usuario
           )
-          VALUES ($1,$2,$3,$4,'DEVOLUCION_VENTA',$5,$6,$7,$8,$9,$10)
+          VALUES (
+            $1,$2,$3,$4,
+            'DEVOLUCION_VENTA',
+            $5,$6,$7,$8,$9,$10
+          )
           `,
           [
             venta.id_sucursal,
             detalle.id_producto,
             detalle.id_variante,
-            loteVenta.id_lote,
-            cantidadARestituir,
+            idLote,
+            Number(cantidad || 0),
             stockSucursalAnterior,
             stockSucursalNuevo,
             folioDevolucion,
@@ -2651,61 +2879,441 @@ export const devolverVenta = async (req, res) => {
             req.usuario.id_usuario,
           ]
         );
+      };
 
-        cantidadPendienteRestituir = redondearDos(
-          cantidadPendienteRestituir - cantidadARestituir
+    /*
+     * Restituimos inventario.
+     */
+    for (
+      const detalle of
+      detallesDevueltos
+    ) {
+      let cantidadPendienteRestituir =
+        Number(
+          detalle.cantidad_devuelta
         );
+
+      /*
+       * PRODUCTO SIN CONTROL DE LOTES
+       *
+       * No depende de inventario_movimientos de tipo VENTA,
+       * porque las ventas sin lote no generan un movimiento
+       * por lote en la implementación actual.
+       */
+      if (!detalle.controla_lotes) {
+        await restituirInventarioVariante({
+          detalle,
+          cantidad:
+            cantidadPendienteRestituir,
+        });
+
+        const stockSucursal =
+          await restituirInventarioSucursal({
+            detalle,
+            cantidad:
+              cantidadPendienteRestituir,
+          });
+
+        await registrarDetalleDevolucion({
+          detalle,
+          idLote: null,
+          cantidad:
+            cantidadPendienteRestituir,
+          stockSucursalAnterior:
+            stockSucursal.stock_anterior,
+          stockSucursalNuevo:
+            stockSucursal.stock_nuevo,
+        });
+
+        cantidadPendienteRestituir = 0;
+        continue;
       }
 
-      if (cantidadPendienteRestituir > 0) {
+      /*
+       * PRODUCTO CON CONTROL DE LOTES
+       *
+       * Para una venta con lote seleccionado, venta_detalle.id_lote
+       * permite identificar exactamente el lote que debe restituirse.
+       * Si id_lote quedó NULL (por ejemplo una venta FEFO histórica),
+       * se recuperan todos los movimientos de ese producto/variante.
+       *
+       * Para productos SIN variantes NO filtramos por id_variante:
+       * esto permite devolver ventas antiguas cuyos registros recibieron
+       * una variante principal durante la migración.
+       */
+      const paramsMovimientos = [
+        venta.folio,
+        detalle.id_producto,
+      ];
+
+      let queryMovimientos = `
+        SELECT
+          im.id_movimiento,
+          im.id_lote,
+          im.id_variante,
+          il.lote,
+          im.cantidad,
+          im.stock_nuevo
+        FROM inventario_movimientos im
+        LEFT JOIN inventario_lotes il
+          ON il.id_lote = im.id_lote
+        WHERE im.referencia = $1
+          AND im.tipo_movimiento = 'VENTA'
+          AND im.id_producto = $2
+      `;
+
+      if (detalle.id_lote) {
+        paramsMovimientos.push(
+          detalle.id_lote
+        );
+
+        queryMovimientos += `
+          AND im.id_lote IS NOT DISTINCT FROM
+              $${paramsMovimientos.length}::bigint
+        `;
+      }
+
+      if (
+        detalle.usa_variantes &&
+        detalle.id_variante
+      ) {
+        paramsMovimientos.push(
+          detalle.id_variante
+        );
+
+        queryMovimientos += `
+          AND im.id_variante IS NOT DISTINCT FROM
+              $${paramsMovimientos.length}::integer
+        `;
+      }
+
+      queryMovimientos += `
+        ORDER BY
+          im.fecha_movimiento ASC,
+          im.id_movimiento ASC
+      `;
+
+      const lotesVentaResultado =
+        await client.query(
+          queryMovimientos,
+          paramsMovimientos
+        );
+
+      /*
+       * Compatibilidad extra:
+       * si la venta es histórica y venta_detalle.id_lote apunta a un
+       * dato que ya fue normalizado, intentamos de nuevo sin ese filtro.
+       */
+      let movimientosVenta =
+        lotesVentaResultado.rows;
+
+      if (
+        movimientosVenta.length === 0 &&
+        detalle.id_lote &&
+        !detalle.usa_variantes
+      ) {
+        const fallback =
+          await client.query(
+            `
+            SELECT
+              im.id_movimiento,
+              im.id_lote,
+              im.id_variante,
+              il.lote,
+              im.cantidad,
+              im.stock_nuevo
+            FROM inventario_movimientos im
+            LEFT JOIN inventario_lotes il
+              ON il.id_lote = im.id_lote
+            WHERE im.referencia = $1
+              AND im.tipo_movimiento = 'VENTA'
+              AND im.id_producto = $2
+            ORDER BY
+              im.fecha_movimiento ASC,
+              im.id_movimiento ASC
+            `,
+            [
+              venta.folio,
+              detalle.id_producto,
+            ]
+          );
+
+        movimientosVenta =
+          fallback.rows;
+      }
+
+      if (
+        movimientosVenta.length === 0
+      ) {
         await client.query('ROLLBACK');
 
         return res.status(400).json({
           ok: false,
-          mensaje: `No se pudo restituir completamente ${detalle.producto}. Pendiente: ${cantidadPendienteRestituir}`,
+          mensaje:
+            `No se encontraron movimientos de inventario de venta para ${detalle.producto}`,
+        });
+      }
+
+      for (
+        const loteVenta of
+        movimientosVenta
+      ) {
+        if (
+          cantidadPendienteRestituir <= 0
+        ) {
+          break;
+        }
+
+        if (!loteVenta.id_lote) {
+          continue;
+        }
+
+        /*
+         * Calculamos cuánto de ESTE detalle/lote ya fue devuelto.
+         * Usar id_detalle evita mezclar devoluciones de dos renglones
+         * del mismo producto.
+         */
+        const devueltoPorLoteResultado =
+          await client.query(
+            `
+            SELECT
+              COALESCE(
+                SUM(cantidad_devuelta),
+                0
+              )::numeric(12,2) AS cantidad_devuelta
+            FROM ventas_devoluciones_detalle
+            WHERE id_venta = $1
+              AND id_detalle = $2
+              AND id_lote IS NOT DISTINCT FROM $3::bigint
+            `,
+            [
+              venta.id_venta,
+              detalle.id_detalle,
+              loteVenta.id_lote,
+            ]
+          );
+
+        const cantidadLoteVendida =
+          Number(
+            loteVenta.cantidad || 0
+          );
+
+        const cantidadLoteYaDevuelta =
+          Number(
+            devueltoPorLoteResultado
+              .rows[0]
+              ?.cantidad_devuelta || 0
+          );
+
+        const cantidadLoteDisponible =
+          cantidadLoteVendida -
+          cantidadLoteYaDevuelta;
+
+        if (
+          cantidadLoteDisponible <= 0
+        ) {
+          continue;
+        }
+
+        const cantidadARestituir =
+          Math.min(
+            cantidadPendienteRestituir,
+            cantidadLoteDisponible
+          );
+
+        const paramsLote = [
+          loteVenta.id_lote,
+          venta.id_sucursal,
+          detalle.id_producto,
+        ];
+
+        let queryLote = `
+          SELECT
+            id_lote,
+            id_sucursal,
+            id_producto,
+            id_variante,
+            stock_actual
+          FROM inventario_lotes
+          WHERE id_lote = $1
+            AND id_sucursal = $2
+            AND id_producto = $3
+        `;
+
+        /*
+         * Solo exigimos variante cuando el producto realmente la usa.
+         */
+        if (
+          detalle.usa_variantes &&
+          detalle.id_variante
+        ) {
+          paramsLote.push(
+            detalle.id_variante
+          );
+
+          queryLote += `
+            AND id_variante IS NOT DISTINCT FROM
+                $${paramsLote.length}::integer
+          `;
+        }
+
+        queryLote += `
+          FOR UPDATE
+        `;
+
+        const loteActualResultado =
+          await client.query(
+            queryLote,
+            paramsLote
+          );
+
+        if (
+          loteActualResultado.rows.length === 0
+        ) {
+          await client.query('ROLLBACK');
+
+          return res.status(404).json({
+            ok: false,
+            mensaje:
+              `No se encontró el lote para restituir ${detalle.producto}`,
+          });
+        }
+
+        const stockLoteAnterior =
+          Number(
+            loteActualResultado.rows[0]
+              .stock_actual || 0
+          );
+
+        const stockLoteNuevo =
+          redondearDos(
+            stockLoteAnterior +
+            cantidadARestituir
+          );
+
+        await client.query(
+          `
+          UPDATE inventario_lotes
+          SET
+            stock_actual = $1,
+            activo = true,
+            fecha_actualizacion = CURRENT_TIMESTAMP
+          WHERE id_lote = $2
+          `,
+          [
+            stockLoteNuevo,
+            loteVenta.id_lote,
+          ]
+        );
+
+        /*
+         * SOLO restituimos inventario de variante si el producto
+         * realmente usa variantes.
+         */
+        await restituirInventarioVariante({
+          detalle,
+          cantidad:
+            cantidadARestituir,
+        });
+
+        const stockSucursal =
+          await restituirInventarioSucursal({
+            detalle,
+            cantidad:
+              cantidadARestituir,
+          });
+
+        await registrarDetalleDevolucion({
+          detalle,
+          idLote:
+            loteVenta.id_lote,
+          cantidad:
+            cantidadARestituir,
+          stockSucursalAnterior:
+            stockSucursal.stock_anterior,
+          stockSucursalNuevo:
+            stockSucursal.stock_nuevo,
+        });
+
+        cantidadPendienteRestituir =
+          redondearDos(
+            cantidadPendienteRestituir -
+            cantidadARestituir
+          );
+      }
+
+      if (
+        cantidadPendienteRestituir > 0
+      ) {
+        await client.query('ROLLBACK');
+
+        return res.status(400).json({
+          ok: false,
+          mensaje:
+            `No se pudo restituir completamente ${detalle.producto}. Pendiente: ${cantidadPendienteRestituir}`,
         });
       }
     }
 
-    const totalVendidoResultado = await client.query(
-      `
-      SELECT COALESCE(SUM(cantidad), 0)::numeric(12,2) AS cantidad_vendida
-      FROM venta_detalle
-      WHERE id_venta = $1
-      `,
-      [venta.id_venta]
-    );
+    const totalVendidoResultado =
+      await client.query(
+        `
+        SELECT
+          COALESCE(
+            SUM(cantidad),
+            0
+          )::numeric(12,2) AS cantidad_vendida
+        FROM venta_detalle
+        WHERE id_venta = $1
+        `,
+        [venta.id_venta]
+      );
 
-    const totalDevueltoResultado = await client.query(
-      `
-      SELECT COALESCE(SUM(cantidad_devuelta), 0)::numeric(12,2) AS cantidad_devuelta
-      FROM ventas_devoluciones_detalle
-      WHERE id_venta = $1
-      `,
-      [venta.id_venta]
-    );
+    const totalDevueltoResultado =
+      await client.query(
+        `
+        SELECT
+          COALESCE(
+            SUM(cantidad_devuelta),
+            0
+          )::numeric(12,2) AS cantidad_devuelta
+        FROM ventas_devoluciones_detalle
+        WHERE id_venta = $1
+        `,
+        [venta.id_venta]
+      );
 
-    const cantidadVendidaTotal = Number(
-      totalVendidoResultado.rows[0]?.cantidad_vendida || 0
-    );
-    const cantidadDevueltaTotal = Number(
-      totalDevueltoResultado.rows[0]?.cantidad_devuelta || 0
-    );
+    const cantidadVendidaTotal =
+      Number(
+        totalVendidoResultado.rows[0]
+          ?.cantidad_vendida || 0
+      );
+
+    const cantidadDevueltaTotal =
+      Number(
+        totalDevueltoResultado.rows[0]
+          ?.cantidad_devuelta || 0
+      );
 
     const nuevoEstadoVenta =
-      cantidadDevueltaTotal >= cantidadVendidaTotal
+      cantidadDevueltaTotal >=
+      cantidadVendidaTotal
         ? 'DEVUELTA'
         : 'DEVUELTA_PARCIAL';
 
-    const ventaActualizadaResultado = await client.query(
-      `
-      UPDATE ventas
-      SET estado = $1
-      WHERE id_venta = $2
-      RETURNING *
-      `,
-      [nuevoEstadoVenta, venta.id_venta]
-    );
+    const ventaActualizadaResultado =
+      await client.query(
+        `
+        UPDATE ventas
+        SET estado = $1
+        WHERE id_venta = $2
+        RETURNING *
+        `,
+        [
+          nuevoEstadoVenta,
+          venta.id_venta,
+        ]
+      );
 
     await client.query(
       `
@@ -2720,7 +3328,10 @@ export const devolverVenta = async (req, res) => {
         observaciones,
         id_usuario
       )
-      VALUES ($1,$2,'DEVOLUCION_VENTA',$3,$4,$5,$6,$7,$8)
+      VALUES (
+        $1,$2,'DEVOLUCION_VENTA',
+        $3,$4,$5,$6,$7,$8
+      )
       `,
       [
         venta.id_sesion,
@@ -2738,26 +3349,44 @@ export const devolverVenta = async (req, res) => {
 
     return res.status(201).json({
       ok: true,
-      mensaje: 'Devolución aplicada correctamente',
+      mensaje:
+        'Devolución aplicada correctamente',
       devolucion,
-      venta: ventaActualizadaResultado.rows[0],
+      venta:
+        ventaActualizadaResultado.rows[0],
       resumen: {
-        folio_devolucion: folioDevolucion,
-        folio_venta: venta.folio,
-        metodo_pago_original: venta.metodo_pago,
-        monto_devuelto: montoDevueltoTotal,
-        estado_venta: nuevoEstadoVenta,
+        folio_devolucion:
+          folioDevolucion,
+        folio_venta:
+          venta.folio,
+        metodo_pago_original:
+          venta.metodo_pago,
+        monto_devuelto:
+          montoDevueltoTotal,
+        estado_venta:
+          nuevoEstadoVenta,
       },
     });
   } catch (error) {
-    await client.query('ROLLBACK');
+    try {
+      await client.query('ROLLBACK');
+    } catch {
+      // Si la transacción ya fue revertida, no hacemos nada.
+    }
 
-    console.error('Error al devolver venta:', error);
+    console.error(
+      'Error al devolver venta:',
+      error
+    );
 
-    return res.status(500).json({
-      ok: false,
-      mensaje: error.message || 'Error interno al devolver venta',
-    });
+    return res
+      .status(error.statusCode || 500)
+      .json({
+        ok: false,
+        mensaje:
+          error.message ||
+          'Error interno al devolver venta',
+      });
   } finally {
     client.release();
   }
