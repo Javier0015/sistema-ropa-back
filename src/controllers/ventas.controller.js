@@ -1871,13 +1871,31 @@ export const obtenerInfoDevolucionVenta = async (req, res) => {
 
       LEFT JOIN (
         SELECT
-          id_detalle,
+          movimientos.id_detalle,
           COALESCE(
-            SUM(cantidad_devuelta),
+            SUM(movimientos.cantidad_devuelta),
             0
           )::numeric(12,2) AS cantidad_devuelta
-        FROM ventas_devoluciones_detalle
-        GROUP BY id_detalle
+        FROM (
+          SELECT
+            vdd.id_detalle,
+            vdd.cantidad_devuelta
+          FROM ventas_devoluciones_detalle vdd
+          INNER JOIN ventas_devoluciones vdev
+            ON vdev.id_devolucion = vdd.id_devolucion
+          WHERE vdev.estado = 'APLICADA'
+
+          UNION ALL
+
+          SELECT
+            cde.id_detalle_venta AS id_detalle,
+            cde.cantidad AS cantidad_devuelta
+          FROM cambios_devoluciones_entrada cde
+          INNER JOIN cambios_devoluciones cd
+            ON cd.id_cambio = cde.id_cambio
+          WHERE cd.estado = 'APLICADA'
+        ) movimientos
+        GROUP BY movimientos.id_detalle
       ) dev
         ON dev.id_detalle = vd.id_detalle
 
@@ -2487,11 +2505,26 @@ export const devolverVenta = async (req, res) => {
           `
           SELECT
             COALESCE(
-              SUM(cantidad_devuelta),
+              SUM(movimientos.cantidad_devuelta),
               0
             )::numeric(12,2) AS cantidad_devuelta
-          FROM ventas_devoluciones_detalle
-          WHERE id_detalle = $1
+          FROM (
+            SELECT vdd.cantidad_devuelta
+            FROM ventas_devoluciones_detalle vdd
+            INNER JOIN ventas_devoluciones vdev
+              ON vdev.id_devolucion = vdd.id_devolucion
+            WHERE vdd.id_detalle = $1
+              AND vdev.estado = 'APLICADA'
+
+            UNION ALL
+
+            SELECT cde.cantidad AS cantidad_devuelta
+            FROM cambios_devoluciones_entrada cde
+            INNER JOIN cambios_devoluciones cd
+              ON cd.id_cambio = cde.id_cambio
+            WHERE cde.id_detalle_venta = $1
+              AND cd.estado = 'APLICADA'
+          ) movimientos
           `,
           [idDetalle]
         );
@@ -3078,13 +3111,30 @@ export const devolverVenta = async (req, res) => {
             `
             SELECT
               COALESCE(
-                SUM(cantidad_devuelta),
+                SUM(movimientos.cantidad_devuelta),
                 0
               )::numeric(12,2) AS cantidad_devuelta
-            FROM ventas_devoluciones_detalle
-            WHERE id_venta = $1
-              AND id_detalle = $2
-              AND id_lote IS NOT DISTINCT FROM $3::bigint
+            FROM (
+              SELECT vdd.cantidad_devuelta
+              FROM ventas_devoluciones_detalle vdd
+              INNER JOIN ventas_devoluciones vdev
+                ON vdev.id_devolucion = vdd.id_devolucion
+              WHERE vdd.id_venta = $1
+                AND vdd.id_detalle = $2
+                AND vdd.id_lote IS NOT DISTINCT FROM $3::bigint
+                AND vdev.estado = 'APLICADA'
+
+              UNION ALL
+
+              SELECT cde.cantidad AS cantidad_devuelta
+              FROM cambios_devoluciones_entrada cde
+              INNER JOIN cambios_devoluciones cd
+                ON cd.id_cambio = cde.id_cambio
+              WHERE cde.id_venta_original = $1
+                AND cde.id_detalle_venta = $2
+                AND cde.id_lote IS NOT DISTINCT FROM $3::bigint
+                AND cd.estado = 'APLICADA'
+            ) movimientos
             `,
             [
               venta.id_venta,
@@ -3274,11 +3324,26 @@ export const devolverVenta = async (req, res) => {
         `
         SELECT
           COALESCE(
-            SUM(cantidad_devuelta),
+            SUM(movimientos.cantidad_devuelta),
             0
           )::numeric(12,2) AS cantidad_devuelta
-        FROM ventas_devoluciones_detalle
-        WHERE id_venta = $1
+        FROM (
+          SELECT vdd.cantidad_devuelta
+          FROM ventas_devoluciones_detalle vdd
+          INNER JOIN ventas_devoluciones vdev
+            ON vdev.id_devolucion = vdd.id_devolucion
+          WHERE vdd.id_venta = $1
+            AND vdev.estado = 'APLICADA'
+
+          UNION ALL
+
+          SELECT cde.cantidad AS cantidad_devuelta
+          FROM cambios_devoluciones_entrada cde
+          INNER JOIN cambios_devoluciones cd
+            ON cd.id_cambio = cde.id_cambio
+          WHERE cde.id_venta_original = $1
+            AND cd.estado = 'APLICADA'
+        ) movimientos
         `,
         [venta.id_venta]
       );

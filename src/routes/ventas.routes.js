@@ -10,6 +10,13 @@ import {
   cancelarServicioClinicoPendiente,
 } from '../controllers/ventas.controller.js';
 
+import {
+  buscarVentaParaCambio,
+  listarVentasParaCambioPorFecha,
+  crearCambioDevolucion,
+  listarCambiosDevoluciones,
+} from '../controllers/devoluciones.controller.js';
+
 import { verificarToken } from '../middlewares/auth.middleware.js';
 
 const router = Router();
@@ -27,6 +34,37 @@ router.patch(
   '/servicios-clinicos/:idSolicitud/cancelar-pendiente',
   verificarToken,
   cancelarServicioClinicoPendiente
+);
+
+/*
+ * Nuevo módulo: Cambios / Devoluciones.
+ *
+ * IMPORTANTE:
+ * Estas rutas deben ir antes de /:id para que Express no interprete
+ * "cambios" como si fuera un id de venta.
+ */
+router.get(
+  '/cambios/ventas-dia',
+  verificarToken,
+  listarVentasParaCambioPorFecha
+);
+
+router.get(
+  '/cambios/buscar-venta',
+  verificarToken,
+  buscarVentaParaCambio
+);
+
+router.get(
+  '/cambios/historial',
+  verificarToken,
+  listarCambiosDevoluciones
+);
+
+router.post(
+  '/cambios',
+  verificarToken,
+  crearCambioDevolucion
 );
 
 /*
