@@ -49,6 +49,7 @@ const configuracionVariantesDefault = {
   modelo: false,
   aroma: false,
   capacidad: false,
+  precio: false,
   personalizados: [],
 };
 
@@ -62,6 +63,7 @@ const clavesVariantesPermitidas = [
   'modelo',
   'aroma',
   'capacidad',
+  'precio',
 ];
 
 const crearClaveAtributo = (texto) => {

@@ -35,6 +35,7 @@ const configuracionVariantesDefault = {
   modelo: false,
   aroma: false,
   capacidad: false,
+  precio: false,
   personalizados: [],
 };
 
@@ -137,16 +138,30 @@ const obtenerNombreVarianteDesdeAtributos = (
 
   if (nombreManual) return nombreManual;
 
-  const claves = obtenerClavesVariantesConfiguradas(
+  const configuracion = normalizarConfiguracionVariantes(
     configuracionVariantes
   );
 
-  return (
-    claves
-      .map((clave) => atributos?.[clave])
-      .filter(Boolean)
-      .join(' · ') || 'Variante'
+  const claves = obtenerClavesVariantesConfiguradas(
+    configuracion
   );
+
+  const nombrePorAtributos = claves
+    .map((clave) => atributos?.[clave])
+    .filter(Boolean)
+    .join(' · ');
+
+  if (nombrePorAtributos) return nombrePorAtributos;
+
+  if (normalizarBooleano(configuracion.precio, false)) {
+    const precio = Number(variante?.precio_venta);
+
+    if (Number.isFinite(precio) && precio >= 0) {
+      return `Precio $${precio.toFixed(2)}`;
+    }
+  }
+
+  return 'Variante';
 };
 
 const buscarOCrearVariante = async ({
@@ -176,6 +191,40 @@ const buscarOCrearVariante = async ({
   const codigoBarras = normalizarTextoNullable(
     variante?.codigo_barras
   );
+
+  const configuracionVariantes = normalizarConfiguracionVariantes(
+    producto.configuracion_variantes
+  );
+  const usaPrecioPorVariante = normalizarBooleano(
+    configuracionVariantes.precio,
+    false
+  );
+
+  const clavesIdentidad = obtenerClavesVariantesConfiguradas(
+    configuracionVariantes
+  );
+  const usaSoloPrecioComoIdentidad =
+    clavesIdentidad.length === 0 && usaPrecioPorVariante;
+
+  let precioVentaVariante = Number(producto.precio_venta || 0);
+
+  if (usaPrecioPorVariante) {
+    if (
+      variante?.precio_venta === undefined ||
+      variante?.precio_venta === null ||
+      variante?.precio_venta === '' ||
+      !Number.isFinite(Number(variante.precio_venta)) ||
+      Number(variante.precio_venta) < 0
+    ) {
+      const error = new Error(
+        'El precio de venta es obligatorio para cada variante y no puede ser negativo'
+      );
+      error.statusCode = 400;
+      throw error;
+    }
+
+    precioVentaVariante = Number(variante.precio_venta);
+  }
 
   const nombreVariante = obtenerNombreVarianteDesdeAtributos(
     variante,
@@ -235,7 +284,27 @@ const buscarOCrearVariante = async ({
     existente = resultado.rows[0] || null;
   }
 
-  if (!existente) {
+  if (!existente && usaSoloPrecioComoIdentidad) {
+    const resultado = await client.query(
+      `
+        SELECT *
+        FROM producto_variantes
+        WHERE id_producto = $1
+          AND COALESCE(talla, '') = ''
+          AND COALESCE(color, '') = ''
+          AND COALESCE(tono, '') = ''
+          AND COALESCE(presentacion, '') = ''
+          AND COALESCE(atributos, '{}'::jsonb) = '{}'::jsonb
+          AND precio_venta = $2
+        LIMIT 1
+      `,
+      [producto.id_producto, precioVentaVariante]
+    );
+
+    existente = resultado.rows[0] || null;
+  }
+
+  if (!existente && !usaSoloPrecioComoIdentidad) {
     const resultado = await client.query(
       `
         SELECT *
@@ -274,7 +343,7 @@ const buscarOCrearVariante = async ({
           tono = $6,
           presentacion = $7,
           precio_compra = COALESCE($8, precio_compra),
-          precio_venta = COALESCE($9, precio_venta),
+          precio_venta = $9,
           atributos = $10::jsonb,
           activo = true,
           fecha_actualizacion = CURRENT_TIMESTAMP
@@ -294,11 +363,7 @@ const buscarOCrearVariante = async ({
         variante?.precio_compra !== ''
           ? Number(variante.precio_compra)
           : null,
-        variante?.precio_venta !== undefined &&
-        variante?.precio_venta !== null &&
-        variante?.precio_venta !== ''
-          ? Number(variante.precio_venta)
-          : null,
+        precioVentaVariante,
         JSON.stringify(atributos),
         existente.id_variante,
       ]
@@ -343,11 +408,7 @@ const buscarOCrearVariante = async ({
       variante?.precio_compra !== ''
         ? Number(variante.precio_compra)
         : Number(producto.precio_compra || 0),
-      variante?.precio_venta !== undefined &&
-      variante?.precio_venta !== null &&
-      variante?.precio_venta !== ''
-        ? Number(variante.precio_venta)
-        : Number(producto.precio_venta || 0),
+      precioVentaVariante,
       JSON.stringify(atributos),
     ]
   );
@@ -705,6 +766,7 @@ export const listarInventarioPorSucursal = async (req, res) => {
               'presentacion', pv.presentacion,
               'precio_compra', pv.precio_compra,
               'precio_venta', pv.precio_venta,
+              'imagen_referencia', pv.imagen_referencia,
               'atributos', COALESCE(pv.atributos, '{}'::jsonb),
               'stock_actual', ivs.stock_actual,
               'stock_minimo', ivs.stock_minimo,
@@ -1004,18 +1066,36 @@ export const asignarInventario = async (req, res) => {
         });
       }
 
-      const clavesConfiguradas =
-        obtenerClavesVariantesConfiguradas(
+      const configuracionVariantesProducto =
+        normalizarConfiguracionVariantes(
           producto.configuracion_variantes
         );
 
-      if (clavesConfiguradas.length === 0) {
+      const clavesConfiguradas =
+        obtenerClavesVariantesConfiguradas(
+          configuracionVariantesProducto
+        );
+
+      const usaPrecioPorVariante = normalizarBooleano(
+        configuracionVariantesProducto.precio,
+        false
+      );
+
+      /*
+       * El precio puede ser la única identidad de una variante.
+       * Por eso solo rechazamos la configuración cuando no hay atributos
+       * estructurales ni está habilitado precio por variante.
+       */
+      if (
+        clavesConfiguradas.length === 0 &&
+        !usaPrecioPorVariante
+      ) {
         await client.query('ROLLBACK');
 
         return res.status(400).json({
           ok: false,
           mensaje:
-            'El producto usa variantes pero no tiene configuracion_variantes definida.',
+            'El producto usa variantes pero no tiene atributos ni precio por variante configurados.',
         });
       }
 
@@ -1929,6 +2009,7 @@ export const listarMovimientosInventario = async (req, res) => {
         pv.color,
         pv.tono,
         pv.presentacion AS presentacion_variante,
+        pv.precio_venta AS precio_venta_variante,
         COALESCE(pv.atributos, '{}'::jsonb) AS atributos,
 
         m.id_lote,
@@ -2039,6 +2120,7 @@ export const listarLotesProducto = async (req, res) => {
         pv.color,
         pv.tono,
         pv.presentacion AS presentacion_variante,
+        pv.imagen_referencia,
         COALESCE(pv.atributos, '{}'::jsonb) AS atributos,
 
         il.id_proveedor,
@@ -2123,6 +2205,7 @@ export const actualizarLote = async (req, res) => {
     const { id_lote } = req.params;
 
     const {
+      variante,
       id_proveedor,
       lote,
       fecha_caducidad,
@@ -2212,6 +2295,332 @@ export const actualizarLote = async (req, res) => {
     }
 
     const loteActual = loteActualResultado.rows[0];
+
+    let varianteActualizada = null;
+
+    if (variante && loteActual.id_variante) {
+      const idVariantePayload = Number(
+        variante.id_variante || loteActual.id_variante
+      );
+
+      if (
+        !Number.isInteger(idVariantePayload) ||
+        idVariantePayload <= 0 ||
+        Number(idVariantePayload) !==
+          Number(loteActual.id_variante)
+      ) {
+        await client.query('ROLLBACK');
+
+        return res.status(400).json({
+          ok: false,
+          mensaje:
+            'La variante enviada no corresponde a la variante asociada al lote',
+        });
+      }
+
+      const productoVarianteResultado = await client.query(
+        `
+          SELECT
+            id_producto,
+            usa_variantes,
+            configuracion_variantes
+          FROM productos
+          WHERE id_producto = $1
+          LIMIT 1
+        `,
+        [loteActual.id_producto]
+      );
+
+      if (productoVarianteResultado.rows.length === 0) {
+        await client.query('ROLLBACK');
+
+        return res.status(404).json({
+          ok: false,
+          mensaje:
+            'No se encontró el producto asociado a la variante del lote',
+        });
+      }
+
+      const productoVariante =
+        productoVarianteResultado.rows[0];
+
+      if (
+        !normalizarBooleano(
+          productoVariante.usa_variantes,
+          false
+        )
+      ) {
+        await client.query('ROLLBACK');
+
+        return res.status(400).json({
+          ok: false,
+          mensaje:
+            'El producto ya no está configurado para usar variantes',
+        });
+      }
+
+      const configuracionVariante =
+        normalizarConfiguracionVariantes(
+          productoVariante.configuracion_variantes
+        );
+
+      const atributosVariante =
+        normalizarAtributosEntrada(
+          variante,
+          configuracionVariante
+        );
+
+      const nombreVariante =
+        obtenerNombreVarianteDesdeAtributos(
+          variante,
+          atributosVariante,
+          configuracionVariante
+        );
+
+      const skuVariante =
+        normalizarTextoNullable(variante.sku);
+
+      const codigoBarrasVariante =
+        normalizarTextoNullable(
+          variante.codigo_barras
+        );
+
+      const tallaVariante =
+        normalizarTextoNullable(
+          variante.talla ?? atributosVariante.talla
+        );
+
+      const colorVariante =
+        normalizarTextoNullable(
+          variante.color ?? atributosVariante.color
+        );
+
+      const tonoVariante =
+        normalizarTextoNullable(
+          variante.tono ?? atributosVariante.tono
+        );
+
+      const presentacionVariante =
+        normalizarTextoNullable(
+          variante.presentacion ??
+            atributosVariante.presentacion
+        );
+
+      const usaPrecioPorVariante =
+        normalizarBooleano(
+          configuracionVariante.precio,
+          false
+        );
+
+      const clavesIdentidadVariante =
+        obtenerClavesVariantesConfiguradas(
+          configuracionVariante
+        );
+      const usaSoloPrecioComoIdentidadVariante =
+        clavesIdentidadVariante.length === 0 &&
+        usaPrecioPorVariante;
+
+      let precioVentaVariante = null;
+
+      if (usaPrecioPorVariante) {
+        if (
+          variante.precio_venta === undefined ||
+          variante.precio_venta === null ||
+          variante.precio_venta === '' ||
+          !Number.isFinite(
+            Number(variante.precio_venta)
+          ) ||
+          Number(variante.precio_venta) < 0
+        ) {
+          await client.query('ROLLBACK');
+
+          return res.status(400).json({
+            ok: false,
+            mensaje:
+              'El precio de venta de la variante debe ser un número igual o mayor a cero',
+          });
+        }
+
+        precioVentaVariante =
+          Number(variante.precio_venta);
+      }
+
+      if (skuVariante) {
+        const skuDuplicado = await client.query(
+          `
+            SELECT id_variante
+            FROM producto_variantes
+            WHERE id_producto = $1
+              AND LOWER(COALESCE(sku, '')) =
+                  LOWER($2)
+              AND id_variante <> $3
+            LIMIT 1
+          `,
+          [
+            loteActual.id_producto,
+            skuVariante,
+            loteActual.id_variante,
+          ]
+        );
+
+        if (skuDuplicado.rows.length > 0) {
+          await client.query('ROLLBACK');
+
+          return res.status(409).json({
+            ok: false,
+            mensaje:
+              'Ya existe otra variante de este producto con el mismo SKU',
+          });
+        }
+      }
+
+      if (codigoBarrasVariante) {
+        const codigoDuplicado =
+          await client.query(
+            `
+              SELECT id_variante
+              FROM producto_variantes
+              WHERE codigo_barras = $1
+                AND id_variante <> $2
+              LIMIT 1
+            `,
+            [
+              codigoBarrasVariante,
+              loteActual.id_variante,
+            ]
+          );
+
+        if (codigoDuplicado.rows.length > 0) {
+          await client.query('ROLLBACK');
+
+          return res.status(409).json({
+            ok: false,
+            mensaje:
+              'Ya existe otra variante con el mismo código de barras',
+          });
+        }
+      }
+
+      const combinacionDuplicada =
+        usaSoloPrecioComoIdentidadVariante
+          ? await client.query(
+              `
+                SELECT id_variante
+                FROM producto_variantes
+                WHERE id_producto = $1
+                  AND id_variante <> $2
+                  AND COALESCE(talla, '') = ''
+                  AND COALESCE(color, '') = ''
+                  AND COALESCE(tono, '') = ''
+                  AND COALESCE(presentacion, '') = ''
+                  AND COALESCE(atributos, '{}'::jsonb) = '{}'::jsonb
+                  AND precio_venta = $3
+                LIMIT 1
+              `,
+              [
+                loteActual.id_producto,
+                loteActual.id_variante,
+                precioVentaVariante,
+              ]
+            )
+          : await client.query(
+              `
+                SELECT id_variante
+                FROM producto_variantes
+                WHERE id_producto = $1
+                  AND id_variante <> $2
+                  AND COALESCE(talla, '') =
+                      COALESCE($3, '')
+                  AND COALESCE(color, '') =
+                      COALESCE($4, '')
+                  AND COALESCE(tono, '') =
+                      COALESCE($5, '')
+                  AND COALESCE(presentacion, '') =
+                      COALESCE($6, '')
+                  AND COALESCE(
+                        atributos,
+                        '{}'::jsonb
+                      ) = $7::jsonb
+                LIMIT 1
+              `,
+              [
+                loteActual.id_producto,
+                loteActual.id_variante,
+                tallaVariante,
+                colorVariante,
+                tonoVariante,
+                presentacionVariante,
+                JSON.stringify(atributosVariante),
+              ]
+            );
+
+      if (combinacionDuplicada.rows.length > 0) {
+        await client.query('ROLLBACK');
+
+        return res.status(409).json({
+          ok: false,
+          mensaje:
+            'Ya existe otra variante con la misma combinación de atributos',
+        });
+      }
+
+      const varianteActualizadaResultado =
+        await client.query(
+          `
+            UPDATE producto_variantes
+            SET
+              nombre_variante = $1,
+              sku = $2,
+              codigo_barras = $3,
+              talla = $4,
+              color = $5,
+              tono = $6,
+              presentacion = $7,
+              precio_venta =
+                CASE
+                  WHEN $8::boolean
+                    THEN $9::numeric
+                  ELSE precio_venta
+                END,
+              atributos = $10::jsonb,
+              activo = true,
+              fecha_actualizacion =
+                CURRENT_TIMESTAMP
+            WHERE id_variante = $11
+              AND id_producto = $12
+            RETURNING *
+          `,
+          [
+            nombreVariante,
+            skuVariante,
+            codigoBarrasVariante,
+            tallaVariante,
+            colorVariante,
+            tonoVariante,
+            presentacionVariante,
+            usaPrecioPorVariante,
+            precioVentaVariante,
+            JSON.stringify(atributosVariante),
+            loteActual.id_variante,
+            loteActual.id_producto,
+          ]
+        );
+
+      if (
+        varianteActualizadaResultado.rows.length === 0
+      ) {
+        await client.query('ROLLBACK');
+
+        return res.status(404).json({
+          ok: false,
+          mensaje:
+            'No se encontró la variante asociada al lote',
+        });
+      }
+
+      varianteActualizada =
+        varianteActualizadaResultado.rows[0];
+    }
 
     const inventarioActualResultado = await client.query(
       `
@@ -2500,6 +2909,7 @@ export const actualizarLote = async (req, res) => {
           ? 'Lote actualizado y ajuste de inventario registrado correctamente'
           : 'Lote actualizado correctamente',
       lote: loteActualizadoResultado.rows[0],
+      variante: varianteActualizada,
       inventario:
         inventarioActualizadoResultado.rows[0],
       diferencia_stock: diferenciaStock,
@@ -2509,6 +2919,15 @@ export const actualizarLote = async (req, res) => {
     await client.query('ROLLBACK');
 
     console.error('Error al actualizar lote:', error);
+
+    if (error.code === '23505') {
+      return res.status(409).json({
+        ok: false,
+        mensaje:
+          'Ya existe otra variante con el mismo SKU, código de barras o combinación de atributos',
+        error: error.message,
+      });
+    }
 
     return res.status(500).json({
       ok: false,
@@ -3161,3 +3580,61 @@ export const consultarStockSucursales = async (req, res) => {
   }
 };
 
+export const actualizarImagenReferenciaVariante = async (req, res) => {
+  try {
+    const idVariante = Number(req.params.idVariante);
+
+    if (!Number.isInteger(idVariante) || idVariante <= 0) {
+      return res.status(400).json({
+        ok: false,
+        mensaje: 'El ID de la variante no es válido',
+      });
+    }
+
+    if (!req.file) {
+      return res.status(400).json({
+        ok: false,
+        mensaje: 'Selecciona una imagen JPG, PNG o WEBP',
+      });
+    }
+
+    const rutaImagen = `/uploads/variantes/${req.file.filename}`;
+
+    const resultado = await pool.query(
+      `
+        UPDATE producto_variantes
+        SET
+          imagen_referencia = $1,
+          fecha_actualizacion = CURRENT_TIMESTAMP
+        WHERE id_variante = $2
+        RETURNING
+          id_variante,
+          id_producto,
+          nombre_variante,
+          imagen_referencia
+      `,
+      [rutaImagen, idVariante]
+    );
+
+    if (resultado.rows.length === 0) {
+      return res.status(404).json({
+        ok: false,
+        mensaje: 'No se encontró la variante indicada',
+      });
+    }
+
+    return res.json({
+      ok: true,
+      mensaje: 'Imagen de referencia guardada correctamente',
+      variante: resultado.rows[0],
+    });
+  } catch (error) {
+    console.error('Error al guardar imagen de referencia de variante:', error);
+
+    return res.status(500).json({
+      ok: false,
+      mensaje: 'No se pudo guardar la imagen de referencia de la variante',
+      error: error.message,
+    });
+  }
+};
