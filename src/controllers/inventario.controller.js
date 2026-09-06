@@ -35,7 +35,6 @@ const configuracionVariantesDefault = {
   modelo: false,
   aroma: false,
   capacidad: false,
-  precio: false,
   personalizados: [],
 };
 
@@ -153,14 +152,6 @@ const obtenerNombreVarianteDesdeAtributos = (
 
   if (nombrePorAtributos) return nombrePorAtributos;
 
-  if (normalizarBooleano(configuracion.precio, false)) {
-    const precio = Number(variante?.precio_venta);
-
-    if (Number.isFinite(precio) && precio >= 0) {
-      return `Precio $${precio.toFixed(2)}`;
-    }
-  }
-
   return 'Variante';
 };
 
@@ -169,6 +160,22 @@ const buscarOCrearVariante = async ({
   producto,
   variante,
 }) => {
+  const configuracionVariantes = normalizarConfiguracionVariantes(
+    producto.configuracion_variantes
+  );
+
+  const clavesIdentidad = obtenerClavesVariantesConfiguradas(
+    configuracionVariantes
+  );
+
+  if (clavesIdentidad.length === 0) {
+    const error = new Error(
+      'El producto usa variantes pero no tiene atributos configurados para identificarlas'
+    );
+    error.statusCode = 400;
+    throw error;
+  }
+
   const atributos = normalizarAtributosEntrada(
     variante,
     producto.configuracion_variantes
@@ -192,38 +199,35 @@ const buscarOCrearVariante = async ({
     variante?.codigo_barras
   );
 
-  const configuracionVariantes = normalizarConfiguracionVariantes(
-    producto.configuracion_variantes
-  );
-  const usaPrecioPorVariante = normalizarBooleano(
-    configuracionVariantes.precio,
-    false
-  );
+  const precioCompraVariante = Number(variante?.precio_compra);
+  const precioVentaVariante = Number(variante?.precio_venta);
 
-  const clavesIdentidad = obtenerClavesVariantesConfiguradas(
-    configuracionVariantes
-  );
-  const usaSoloPrecioComoIdentidad =
-    clavesIdentidad.length === 0 && usaPrecioPorVariante;
+  if (
+    variante?.precio_compra === undefined ||
+    variante?.precio_compra === null ||
+    variante?.precio_compra === '' ||
+    !Number.isFinite(precioCompraVariante) ||
+    precioCompraVariante < 0
+  ) {
+    const error = new Error(
+      'El precio de compra es obligatorio para cada variante y no puede ser negativo'
+    );
+    error.statusCode = 400;
+    throw error;
+  }
 
-  let precioVentaVariante = Number(producto.precio_venta || 0);
-
-  if (usaPrecioPorVariante) {
-    if (
-      variante?.precio_venta === undefined ||
-      variante?.precio_venta === null ||
-      variante?.precio_venta === '' ||
-      !Number.isFinite(Number(variante.precio_venta)) ||
-      Number(variante.precio_venta) < 0
-    ) {
-      const error = new Error(
-        'El precio de venta es obligatorio para cada variante y no puede ser negativo'
-      );
-      error.statusCode = 400;
-      throw error;
-    }
-
-    precioVentaVariante = Number(variante.precio_venta);
+  if (
+    variante?.precio_venta === undefined ||
+    variante?.precio_venta === null ||
+    variante?.precio_venta === '' ||
+    !Number.isFinite(precioVentaVariante) ||
+    precioVentaVariante < 0
+  ) {
+    const error = new Error(
+      'El precio de venta es obligatorio para cada variante y no puede ser negativo'
+    );
+    error.statusCode = 400;
+    throw error;
   }
 
   const nombreVariante = obtenerNombreVarianteDesdeAtributos(
@@ -284,51 +288,12 @@ const buscarOCrearVariante = async ({
     existente = resultado.rows[0] || null;
   }
 
-  if (!existente && usaSoloPrecioComoIdentidad) {
-    const resultado = await client.query(
-      `
-        SELECT *
-        FROM producto_variantes
-        WHERE id_producto = $1
-          AND COALESCE(talla, '') = ''
-          AND COALESCE(color, '') = ''
-          AND COALESCE(tono, '') = ''
-          AND COALESCE(presentacion, '') = ''
-          AND COALESCE(atributos, '{}'::jsonb) = '{}'::jsonb
-          AND precio_venta = $2
-        LIMIT 1
-      `,
-      [producto.id_producto, precioVentaVariante]
-    );
-
-    existente = resultado.rows[0] || null;
-  }
-
-  if (!existente && !usaSoloPrecioComoIdentidad) {
-    const resultado = await client.query(
-      `
-        SELECT *
-        FROM producto_variantes
-        WHERE id_producto = $1
-          AND COALESCE(talla, '') = COALESCE($2, '')
-          AND COALESCE(color, '') = COALESCE($3, '')
-          AND COALESCE(tono, '') = COALESCE($4, '')
-          AND COALESCE(presentacion, '') = COALESCE($5, '')
-          AND COALESCE(atributos, '{}'::jsonb) = $6::jsonb
-        LIMIT 1
-      `,
-      [
-        producto.id_producto,
-        talla,
-        color,
-        tono,
-        presentacion,
-        JSON.stringify(atributos),
-      ]
-    );
-
-    existente = resultado.rows[0] || null;
-  }
+  /*
+   * No buscamos una variante existente únicamente por sus atributos.
+   * Dos variantes pueden compartir talla/color/etc. y representar diseños
+   * distintos. Solo reutilizamos una variante cuando llega su id_variante,
+   * SKU o código de barras.
+   */
 
   if (existente) {
     const actualizado = await client.query(
@@ -342,7 +307,7 @@ const buscarOCrearVariante = async ({
           color = $5,
           tono = $6,
           presentacion = $7,
-          precio_compra = COALESCE($8, precio_compra),
+          precio_compra = $8,
           precio_venta = $9,
           atributos = $10::jsonb,
           activo = true,
@@ -358,11 +323,7 @@ const buscarOCrearVariante = async ({
         color,
         tono,
         presentacion,
-        variante?.precio_compra !== undefined &&
-        variante?.precio_compra !== null &&
-        variante?.precio_compra !== ''
-          ? Number(variante.precio_compra)
-          : null,
+        precioCompraVariante,
         precioVentaVariante,
         JSON.stringify(atributos),
         existente.id_variante,
@@ -403,11 +364,7 @@ const buscarOCrearVariante = async ({
       color,
       tono,
       presentacion,
-      variante?.precio_compra !== undefined &&
-      variante?.precio_compra !== null &&
-      variante?.precio_compra !== ''
-        ? Number(variante.precio_compra)
-        : Number(producto.precio_compra || 0),
+      precioCompraVariante,
       precioVentaVariante,
       JSON.stringify(atributos),
     ]
@@ -1076,31 +1033,20 @@ export const asignarInventario = async (req, res) => {
           configuracionVariantesProducto
         );
 
-      const usaPrecioPorVariante = normalizarBooleano(
-        configuracionVariantesProducto.precio,
-        false
-      );
-
-      /*
-       * El precio puede ser la única identidad de una variante.
-       * Por eso solo rechazamos la configuración cuando no hay atributos
-       * estructurales ni está habilitado precio por variante.
-       */
-      if (
-        clavesConfiguradas.length === 0 &&
-        !usaPrecioPorVariante
-      ) {
+      if (clavesConfiguradas.length === 0) {
         await client.query('ROLLBACK');
 
         return res.status(400).json({
           ok: false,
           mensaje:
-            'El producto usa variantes pero no tiene atributos ni precio por variante configurados.',
+            'El producto usa variantes pero no tiene atributos configurados para identificarlas.',
         });
       }
 
       for (const variante of variantes) {
         const cantidad = Number(variante?.stock_inicial ?? 0);
+        const precioCompraVariante = Number(variante?.precio_compra);
+        const precioVentaVariante = Number(variante?.precio_venta);
 
         if (!Number.isFinite(cantidad) || cantidad < 0) {
           await client.query('ROLLBACK');
@@ -1109,6 +1055,38 @@ export const asignarInventario = async (req, res) => {
             ok: false,
             mensaje:
               'La cantidad inicial de cada variante debe ser igual o mayor a cero.',
+          });
+        }
+
+        if (
+          variante?.precio_compra === undefined ||
+          variante?.precio_compra === null ||
+          variante?.precio_compra === '' ||
+          !Number.isFinite(precioCompraVariante) ||
+          precioCompraVariante < 0
+        ) {
+          await client.query('ROLLBACK');
+
+          return res.status(400).json({
+            ok: false,
+            mensaje:
+              'Cada variante debe tener un precio de compra válido.',
+          });
+        }
+
+        if (
+          variante?.precio_venta === undefined ||
+          variante?.precio_venta === null ||
+          variante?.precio_venta === '' ||
+          !Number.isFinite(precioVentaVariante) ||
+          precioVentaVariante < 0
+        ) {
+          await client.query('ROLLBACK');
+
+          return res.status(400).json({
+            ok: false,
+            mensaje:
+              'Cada variante debe tener un precio de venta válido.',
           });
         }
 
@@ -1264,12 +1242,7 @@ export const asignarInventario = async (req, res) => {
             lote: loteNormalizado,
             fechaCaducidad: fechaCaducidadNormalizada,
             cantidad,
-            precioCompra:
-              precio_compra !== undefined &&
-              precio_compra !== null &&
-              precio_compra !== ''
-                ? Number(precio_compra)
-                : Number(variante.precio_compra || 0),
+            precioCompra: Number(variante.precio_compra || 0),
           });
 
           lotesCreados.push(loteGuardado);
@@ -1400,7 +1373,7 @@ export const asignarInventario = async (req, res) => {
       return res.status(409).json({
         ok: false,
         mensaje:
-          'Ya existe una variante con el mismo SKU, código de barras o combinación.',
+          'Ya existe una variante con el mismo SKU o código de barras.',
         error: error.message,
       });
     }
@@ -2120,6 +2093,8 @@ export const listarLotesProducto = async (req, res) => {
         pv.color,
         pv.tono,
         pv.presentacion AS presentacion_variante,
+        pv.precio_compra AS precio_compra_variante,
+        pv.precio_venta AS precio_venta_variante,
         pv.imagen_referencia,
         COALESCE(pv.atributos, '{}'::jsonb) AS atributos,
 
@@ -2406,43 +2381,54 @@ export const actualizarLote = async (req, res) => {
             atributosVariante.presentacion
         );
 
-      const usaPrecioPorVariante =
-        normalizarBooleano(
-          configuracionVariante.precio,
-          false
-        );
-
       const clavesIdentidadVariante =
         obtenerClavesVariantesConfiguradas(
           configuracionVariante
         );
-      const usaSoloPrecioComoIdentidadVariante =
-        clavesIdentidadVariante.length === 0 &&
-        usaPrecioPorVariante;
 
-      let precioVentaVariante = null;
+      if (clavesIdentidadVariante.length === 0) {
+        await client.query('ROLLBACK');
 
-      if (usaPrecioPorVariante) {
-        if (
-          variante.precio_venta === undefined ||
-          variante.precio_venta === null ||
-          variante.precio_venta === '' ||
-          !Number.isFinite(
-            Number(variante.precio_venta)
-          ) ||
-          Number(variante.precio_venta) < 0
-        ) {
-          await client.query('ROLLBACK');
+        return res.status(400).json({
+          ok: false,
+          mensaje:
+            'La variante no tiene atributos configurados para identificarla',
+        });
+      }
 
-          return res.status(400).json({
-            ok: false,
-            mensaje:
-              'El precio de venta de la variante debe ser un número igual o mayor a cero',
-          });
-        }
+      const precioCompraVariante = Number(variante.precio_compra);
+      const precioVentaVariante = Number(variante.precio_venta);
 
-        precioVentaVariante =
-          Number(variante.precio_venta);
+      if (
+        variante.precio_compra === undefined ||
+        variante.precio_compra === null ||
+        variante.precio_compra === '' ||
+        !Number.isFinite(precioCompraVariante) ||
+        precioCompraVariante < 0
+      ) {
+        await client.query('ROLLBACK');
+
+        return res.status(400).json({
+          ok: false,
+          mensaje:
+            'El precio de compra de la variante debe ser un número igual o mayor a cero',
+        });
+      }
+
+      if (
+        variante.precio_venta === undefined ||
+        variante.precio_venta === null ||
+        variante.precio_venta === '' ||
+        !Number.isFinite(precioVentaVariante) ||
+        precioVentaVariante < 0
+      ) {
+        await client.query('ROLLBACK');
+
+        return res.status(400).json({
+          ok: false,
+          mensaje:
+            'El precio de venta de la variante debe ser un número igual o mayor a cero',
+        });
       }
 
       if (skuVariante) {
@@ -2501,68 +2487,12 @@ export const actualizarLote = async (req, res) => {
         }
       }
 
-      const combinacionDuplicada =
-        usaSoloPrecioComoIdentidadVariante
-          ? await client.query(
-              `
-                SELECT id_variante
-                FROM producto_variantes
-                WHERE id_producto = $1
-                  AND id_variante <> $2
-                  AND COALESCE(talla, '') = ''
-                  AND COALESCE(color, '') = ''
-                  AND COALESCE(tono, '') = ''
-                  AND COALESCE(presentacion, '') = ''
-                  AND COALESCE(atributos, '{}'::jsonb) = '{}'::jsonb
-                  AND precio_venta = $3
-                LIMIT 1
-              `,
-              [
-                loteActual.id_producto,
-                loteActual.id_variante,
-                precioVentaVariante,
-              ]
-            )
-          : await client.query(
-              `
-                SELECT id_variante
-                FROM producto_variantes
-                WHERE id_producto = $1
-                  AND id_variante <> $2
-                  AND COALESCE(talla, '') =
-                      COALESCE($3, '')
-                  AND COALESCE(color, '') =
-                      COALESCE($4, '')
-                  AND COALESCE(tono, '') =
-                      COALESCE($5, '')
-                  AND COALESCE(presentacion, '') =
-                      COALESCE($6, '')
-                  AND COALESCE(
-                        atributos,
-                        '{}'::jsonb
-                      ) = $7::jsonb
-                LIMIT 1
-              `,
-              [
-                loteActual.id_producto,
-                loteActual.id_variante,
-                tallaVariante,
-                colorVariante,
-                tonoVariante,
-                presentacionVariante,
-                JSON.stringify(atributosVariante),
-              ]
-            );
-
-      if (combinacionDuplicada.rows.length > 0) {
-        await client.query('ROLLBACK');
-
-        return res.status(409).json({
-          ok: false,
-          mensaje:
-            'Ya existe otra variante con la misma combinación de atributos',
-        });
-      }
+      /*
+       * Se permiten combinaciones de atributos repetidas porque pueden
+       * corresponder a diseños distintos. La identidad persistente de cada
+       * variante es su id_variante; SKU y código de barras continúan siendo
+       * identificadores únicos cuando se capturan.
+       */
 
       const varianteActualizadaResultado =
         await client.query(
@@ -2576,16 +2506,11 @@ export const actualizarLote = async (req, res) => {
               color = $5,
               tono = $6,
               presentacion = $7,
-              precio_venta =
-                CASE
-                  WHEN $8::boolean
-                    THEN $9::numeric
-                  ELSE precio_venta
-                END,
+              precio_compra = $8,
+              precio_venta = $9,
               atributos = $10::jsonb,
               activo = true,
-              fecha_actualizacion =
-                CURRENT_TIMESTAMP
+              fecha_actualizacion = CURRENT_TIMESTAMP
             WHERE id_variante = $11
               AND id_producto = $12
             RETURNING *
@@ -2598,7 +2523,7 @@ export const actualizarLote = async (req, res) => {
             colorVariante,
             tonoVariante,
             presentacionVariante,
-            usaPrecioPorVariante,
+            precioCompraVariante,
             precioVentaVariante,
             JSON.stringify(atributosVariante),
             loteActual.id_variante,
@@ -2924,7 +2849,7 @@ export const actualizarLote = async (req, res) => {
       return res.status(409).json({
         ok: false,
         mensaje:
-          'Ya existe otra variante con el mismo SKU, código de barras o combinación de atributos',
+          'Ya existe otra variante con el mismo SKU o código de barras',
         error: error.message,
       });
     }
@@ -3470,6 +3395,8 @@ export const consultarStockSucursales = async (req, res) => {
                   'color', pv.color,
                   'tono', pv.tono,
                   'presentacion', pv.presentacion,
+                  'precio_compra', pv.precio_compra,
+                  'precio_venta', pv.precio_venta,
                   'atributos', COALESCE(pv.atributos, '{}'::jsonb),
                   'stock_actual', ivs.stock_actual,
                   'stock_minimo', ivs.stock_minimo,

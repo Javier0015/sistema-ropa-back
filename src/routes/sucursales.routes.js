@@ -12,7 +12,7 @@ import { verificarToken } from '../middlewares/auth.middleware.js';
 const router = Router();
 
 const soloSuperAdmin = (req, res, next) => {
-  if (req.usuario?.rol !== 'SUPER_ADMIN') {
+  if (req.usuario?.rol !== 'ROOT') {
     return res.status(403).json({
       ok: false,
       mensaje: 'No tienes permisos para administrar sucursales',
