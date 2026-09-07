@@ -36,6 +36,7 @@ import documentosClinicosRoutes from './routes/documentosClinicos.routes.js';
 import controlSanitarioRoutes from './routes/controlSanitario.routes.js';
 import configuracionTicketRoutes from './routes/configuracionTicket.routes.js';
 import configuracionCorreoSmtpRoutes from './routes/configuracionCorreoSmtp.routes.js';
+import permisosRoutes from './routes/permisos.routes.js';
 
 const app = express();
 
@@ -103,6 +104,7 @@ app.use('/api/documentos-clinicos', documentosClinicosRoutes);
 app.use('/api/control-sanitario', controlSanitarioRoutes);
 app.use('/api/configuracion-ticket', configuracionTicketRoutes);
 app.use('/api/configuracion-correo-smtp', configuracionCorreoSmtpRoutes);
+app.use('/api/permisos', permisosRoutes);
 
 // Middleware para rutas no encontradas
 app.use((req, res) => {
